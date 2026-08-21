@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "uuid": "b32e7a16-0fb6-4e78-96d2-9a2eb5d8a401",
+  "version": "2.1.0",
+  "download_url": "https://raw.githubusercontent.com/ninjasoff2-wq/hybrid-ai-autoreply-updates/main/updates/hybrid_ai/hybrid_ai_autoreply.py",
+  "sha256": "4a5933d9200c51cc75db3e1263a759330fe9ce8f565e327a0d6a2cf582dc4843",
+  "mandatory": false,
+  "notes": "Исправления и улучшения Hybrid AI AutoReply."
+}

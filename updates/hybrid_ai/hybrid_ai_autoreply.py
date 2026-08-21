@@ -49,7 +49,7 @@ if TYPE_CHECKING:
 # Метаданные плагина
 # ============================================================================
 NAME = "Hybrid AI AutoReply 🤖 | @revengezza"
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 DESCRIPTION = (
     "Умный AI-заместитель продавца FunPay: Ollama сам решает, когда отвечать, "
     "выбирает шаблоны по смыслу, помнит диалог, работает с лотами и вызывает продавца. "
@@ -102,7 +102,7 @@ LOCAL_OLLAMA_URL = "http://127.0.0.1:11434"
 # Разработчик указывает этот URL ОДИН РАЗ перед распространением плагина.
 # По адресу должен лежать manifest.json, создаваемый комплектным build_release.py.
 # Пример:
-# https://raw.githubusercontent.com/OWNER/REPO/main/updates/hybrid_ai/manifest.json
+# https://raw.githubusercontent.com/ninjasoff2-wq/hybrid-ai-autoreply-updates/main/updates/hybrid_ai/manifest.json
 PUBLISHER_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/ninjasoff2-wq/hybrid-ai-autoreply-updates/main/updates/hybrid_ai/manifest.json"
 UPDATE_MANIFEST_SCHEMA = 1
 UPDATE_MAX_PLUGIN_BYTES = 3 * 1024 * 1024
@@ -1542,14 +1542,27 @@ def resolve_product(c: "Cardinal", m: Any, text: str, force_viewing: bool = Fals
             second_score = ranked[1][1] if len(ranked) > 1 else 0.0
             threshold = float(SETTINGS.get("product_match_threshold", 0.64))
             margin = float(SETTINGS.get("product_match_margin", 0.06))
-            confident = best_score >= threshold and (best_score >= 0.88 or best_score - second_score >= margin)
-            if confident:
-                CHAT_LOT[chat_key] = str(best_lot.get("id") or "")
-                CHAT_LOT_AT[chat_key] = time.time()
-                return best_lot, best_score, "message_text_explicit"
-            # Покупатель явно назвал товар, но вариантов несколько/совпадение слабое.
-            # В этом случае НЕЛЬЗЯ молча подставлять buyer_viewing — лучше уточнить.
-            return None, best_score, "message_text_ambiguous"
+
+            # _has_explicit_product_reference() специально довольно широкая: она
+            # пропускает неизвестные названия товаров. Поэтому само наличие слов в
+            # сообщении ещё НЕ означает, что это товар. Требуем хотя бы заметное
+            # совпадение с реальным каталогом, прежде чем показывать кандидатов.
+            # Это отсекает «привет», «понял», «хорошо», случайные фразы и опечатки,
+            # не имеющие отношения к лотам.
+            ambiguity_floor = max(0.40, threshold - 0.18)
+            if best_score >= ambiguity_floor:
+                confident = best_score >= threshold and (best_score >= 0.88 or best_score - second_score >= margin)
+                if confident:
+                    CHAT_LOT[chat_key] = str(best_lot.get("id") or "")
+                    CHAT_LOT_AT[chat_key] = time.time()
+                    return best_lot, best_score, "message_text_explicit"
+                # Текст действительно похож на каталог, но точный вариант неясен.
+                # Только в этом случае предлагаем покупателю список кандидатов.
+                return None, best_score, "message_text_ambiguous"
+            logger.debug(
+                f"{LOG_PREFIX} chat={chat_key} text_product_match_rejected="
+                f"{best_score:.2f} floor={ambiguity_floor:.2f}"
+            )
 
     # 2) Если явного названия в тексте нет — используем текущий лот FunPay.
     viewing = getattr(m, "buyer_viewing", None)
@@ -2797,13 +2810,28 @@ def _handle_smart_router(c: "Cardinal", m: Any, buyer_text: str, forced_lot: dic
         # на вопрос о товаре; встроенный m.buyer_viewing всё равно используется сразу.
         force_viewing = looks_product_dependent(buyer_text) or _is_context_product_reference(buyer_text)
         lot, _pscore, product_source = resolve_product(c, m, buyer_text, force_viewing=force_viewing)
-        if lot is None and product_source == "message_text_ambiguous":
-            ranked = find_lot_candidates(buyer_text, 3)
+
+    # Если текст похож сразу на несколько лотов, НЕ показываем список до решения AI.
+    # Сначала модель должна понять, был ли это вообще вопрос/запрос о товаре. Это
+    # критично для коротких реплик: «ок», «понял», «привет» и т.п. не должны
+    # запускать каталог только из-за случайного fuzzy-совпадения.
+    ambiguous_ranked: list[tuple[dict[str, Any], float]] = []
+    if lot is None and product_source == "message_text_ambiguous":
+        ambiguous_ranked = find_lot_candidates(buyer_text, 3)
+
+    def request_product_context(reason: str) -> None:
+        if ambiguous_ranked:
             _pending_product_set(m, buyer_text)
+            with LOCK:
+                pending = PENDING_PRODUCT_CLARIFY.get(str(getattr(m, "chat_id", "") or ""))
+                if pending is not None:
+                    pending["candidates"] = [str(x[0].get("id") or "") for x in ambiguous_ranked]
             RUNTIME_STATS["product_ambiguous"] += 1
-            RUNTIME_STATS["last_decision"] = "явный товар неоднозначен — выбор из каталога"
-            _ask_product_candidates(c, m, ranked, no_match=not bool(ranked))
-            return True
+            RUNTIME_STATS["last_decision"] = reason
+            _ask_product_candidates(c, m, ambiguous_ranked, no_match=False)
+        else:
+            _clarify(c, m, product=True, original_text=buyer_text)
+            RUNTIME_STATS["last_decision"] = reason
 
     decision = ollama_route_message(m, buyer_text, lot)
     action = decision["action"]
@@ -2843,16 +2871,14 @@ def _handle_smart_router(c: "Cardinal", m: Any, buyer_text: str, forced_lot: dic
         return True
 
     if action == "clarify_product":
-        _clarify(c, m, product=True, original_text=buyer_text)
-        RUNTIME_STATS["last_decision"] = "AI-router: уточнить товар"
+        request_product_context("AI-router: уточнить товар")
         return True
 
     if action == "template":
         rule = _rule_by_id(decision.get("rule_id"))
         if rule is not None:
             if bool(rule.get("requires_product")) and lot is None:
-                _clarify(c, m, product=True, original_text=buyer_text)
-                RUNTIME_STATS["last_decision"] = f"AI-router: шаблон {rule.get('name')} требует товар"
+                request_product_context(f"AI-router: шаблон {rule.get('name')} требует товар")
                 return True
             reply = render_reply(str(rule.get("reply", "")), lot, m)
             if _send(c, m, reply):
@@ -2869,8 +2895,7 @@ def _handle_smart_router(c: "Cardinal", m: Any, buyer_text: str, forced_lot: dic
 
     if action == "answer":
         if decision.get("needs_product") and lot is None:
-            _clarify(c, m, product=True, original_text=buyer_text)
-            RUNTIME_STATS["last_decision"] = "AI-router: ответ требует товар"
+            request_product_context("AI-router: ответ требует товар")
             return True
 
         answer = str(decision.get("answer") or "").strip()
@@ -3175,23 +3200,10 @@ def process_buyer_message(c: "Cardinal", m: Any, buyer_text: str, forced_lot: di
     if not is_enabled(c):
         return
 
-    # v2.0: если мы не ждём конкретный ответ на ранее заданное уточнение товара,
-    # первым смысловым слоем становится Ollama. Он решает, нужно ли вообще
-    # отвечать, какой шаблон подходит по смыслу, нужен ли товар или живой продавец.
-    pending_active = forced_lot is None and _pending_product_get(getattr(m, "chat_id", "")) is not None
-    if not pending_active:
-        try:
-            if _handle_smart_router(c, m, buyer_text, forced_lot=forced_lot):
-                return
-        except Exception as e:
-            logger.warning(f"{LOG_PREFIX} AI-router недоступен, используется локальный fallback: {type(e).__name__}: {e}")
-            logger.debug("TRACEBACK", exc_info=True)
-            RUNTIME_STATS["errors"] += 1
-            RUNTIME_STATS["last_decision"] = "AI-router ошибка — локальный fallback"
-
-    # Бытовые фразы обрабатываем раньше ожидания товара, fuzzy-правил и Ollama.
-    # Поэтому «Как дела?» не превращается в «Как купить», а если покупатель
-    # отвлекся во время уточнения товара, плагин не ищет среди лотов слово «дела».
+    # v2.1.1: независимые от товара интенты имеют АБСОЛЮТНЫЙ приоритет над
+    # AI-router и fuzzy-поиском лотов. Иначе даже обычное «привет» может сначала
+    # попасть в resolve_product(), получить случайное совпадение с каталогом и
+    # вызвать список кандидатов до того, как сработает обработчик приветствия.
     small_talk = local_small_talk_reply(buyer_text)
     if small_talk is not None:
         kind, reply = small_talk
@@ -3228,6 +3240,19 @@ def process_buyer_message(c: "Cardinal", m: Any, buyer_text: str, forced_lot: di
                 f"local_faq=auto_delivery_meaning"
             )
         return
+
+    # Только после безопасных независимых интентов подключаем Ollama. Он решает,
+    # нужно ли отвечать, какой шаблон подходит по смыслу, нужен ли товар или человек.
+    pending_active = forced_lot is None and _pending_product_get(getattr(m, "chat_id", "")) is not None
+    if not pending_active:
+        try:
+            if _handle_smart_router(c, m, buyer_text, forced_lot=forced_lot):
+                return
+        except Exception as e:
+            logger.warning(f"{LOG_PREFIX} AI-router недоступен, используется локальный fallback: {type(e).__name__}: {e}")
+            logger.debug("TRACEBACK", exc_info=True)
+            RUNTIME_STATS["errors"] += 1
+            RUNTIME_STATS["last_decision"] = "AI-router ошибка — локальный fallback"
 
     # Если предыдущим сообщением плагин спросил «какой товар?», обычно текущее
     # сообщение является названием/описанием товара. Но новый самостоятельный
@@ -3965,7 +3990,7 @@ def init_telegram(cardinal: "Cardinal") -> None:
             msg = admin_send(
                 call.message.chat.id,
                 "Пришлите полный HTTPS URL файла <code>manifest.json</code>.\n\n"
-                "Например: <code>https://raw.githubusercontent.com/OWNER/REPO/main/updates/hybrid_ai/manifest.json</code>\n\n"
+                "Например: <code>https://raw.githubusercontent.com/ninjasoff2-wq/hybrid-ai-autoreply-updates/main/updates/hybrid_ai/manifest.json</code>\n\n"
                 "Отправьте <code>-</code>, чтобы вернуть URL, встроенный разработчиком в плагин.",
                 reply_markup=CLEAR_STATE_BTN(),
             )

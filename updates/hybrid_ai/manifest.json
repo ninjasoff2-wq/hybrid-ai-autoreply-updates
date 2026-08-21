@@ -1,9 +1,9 @@
 {
   "schema": 1,
   "uuid": "b32e7a16-0fb6-4e78-96d2-9a2eb5d8a401",
-  "version": "2.1.1",
+  "version": "2.2.0",
   "download_url": "https://raw.githubusercontent.com/ninjasoff2-wq/hybrid-ai-autoreply-updates/main/updates/hybrid_ai/hybrid_ai_autoreply.py",
-  "sha256": "2113413f2259b878df19da4f4e9094e090adacc1e6f3940d5e1d43bfda4e8f08",
+  "sha256": "4e6f6f78f755b6c88fe36e6bbb0255e567b74e745bb2806bb0b2a155ac4f2d2f",
   "mandatory": false,
-  "notes": "Исправления и улучшения Hybrid AI AutoReply."
+  "notes": "Hybrid AI AutoReply 2.2.0: шаблоны прежде AI, точный выбор лота, FIFO-хронология и ответы только по подтверждённым данным."
 }

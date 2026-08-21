@@ -102,7 +102,7 @@ LOCAL_OLLAMA_URL = "http://127.0.0.1:11434"
 # Разработчик указывает этот URL ОДИН РАЗ перед распространением плагина.
 # По адресу должен лежать manifest.json, создаваемый комплектным build_release.py.
 # Пример:
-# https://raw.githubusercontent.com/ninjasoff2-wq/hybrid-ai-autoreply-updates/main/updates/hybrid_ai/manifest.json
+# https://raw.githubusercontent.com/OWNER/REPO/main/updates/hybrid_ai/manifest.json
 PUBLISHER_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/ninjasoff2-wq/hybrid-ai-autoreply-updates/main/updates/hybrid_ai/manifest.json"
 UPDATE_MANIFEST_SCHEMA = 1
 UPDATE_MAX_PLUGIN_BYTES = 3 * 1024 * 1024
@@ -3965,7 +3965,7 @@ def init_telegram(cardinal: "Cardinal") -> None:
             msg = admin_send(
                 call.message.chat.id,
                 "Пришлите полный HTTPS URL файла <code>manifest.json</code>.\n\n"
-                "Например: <code>https://raw.githubusercontent.com/ninjasoff2-wq/hybrid-ai-autoreply-updates/main/updates/hybrid_ai/manifest.json</code>\n\n"
+                "Например: <code>https://raw.githubusercontent.com/OWNER/REPO/main/updates/hybrid_ai/manifest.json</code>\n\n"
                 "Отправьте <code>-</code>, чтобы вернуть URL, встроенный разработчиком в плагин.",
                 reply_markup=CLEAR_STATE_BTN(),
             )

@@ -54,10 +54,11 @@ if TYPE_CHECKING:
 # Метаданные плагина
 # ============================================================================
 NAME = "Hybrid AI AutoReply 🤖 | @revengezza"
-VERSION = "2.5.6"
+VERSION = "2.5.8"
 DESCRIPTION = (
-    "Умный AI-заместитель продавца FunPay v2.5.6: ведёт связный AI-only диалог независимо от шаблонов, "
-    "не путает бытовой small-talk с лотами даже при fuzzy-совпадениях в описаниях, помнит безопасную хронологию "
+    "Умный AI-заместитель продавца FunPay v2.5.8: в гибридном режиме сначала использует подходящие шаблоны, "
+    "а если шаблон не подошёл — продолжает той же безопасной AI-логикой, что и AI-only. "
+    "Не путает бытовой small-talk с лотами даже при fuzzy-совпадениях в описаниях, помнит безопасную хронологию "
     "прошлых запросов и понимает короткие продолжения. "
     "Факты берутся только из подтверждённых seller/product/buyer-источников; история хранится уже очищенной, "
     "конфиденциальные данные и контакты отсекаются до AI, в логах и перед отправкой, а seller-only role guard "
@@ -3943,7 +3944,7 @@ def _dialogue_reply_guard(chat_id: Any, buyer_text: str, answer: str, intent: st
 
 
 def _safe_ai_only_dialogue_fallback(chat_id: Any, buyer_text: str) -> str:
-    """Минимальный аварийный ответ для AI-only, когда модель недоступна.
+    """Минимальный аварийный диалоговый ответ, когда модель недоступна.
 
     Это не пользовательские шаблоны и не участвует в обычной маршрутизации:
     функция вызывается только после неудачи AI. Её задача — не отвечать
@@ -5327,6 +5328,26 @@ def grounded_fallback_reply(buyer_text: str, lot: dict[str, Any] | None) -> str:
         return _privacy_refusal_reply("contacts")
     if is_seller_trust_question(buyer_text):
         return seller_trust_safe_reply()
+
+    # Очевидные транзакционные вопросы не должны деградировать до сообщения
+    # «в информации продавца не указано», если маленькая модель выбрала неверный
+    # source/evidence. Эти ответы строятся только из уже проверенного lot-context.
+    if is_purchase_permission_question(buyer_text):
+        if lot:
+            return purchase_permission_text(lot)
+        return "Уточните, пожалуйста, какой лот вы хотите купить."
+    if is_quantity_purchase_question(buyer_text):
+        if lot:
+            return quantity_purchase_text(lot)
+        return "Уточните, пожалуйста, для какого лота нужно проверить доступное количество."
+    if is_price_question(buyer_text):
+        if lot:
+            values = product_vars(lot)
+            price = values.get("price", "—")
+            currency = values.get("currency", "")
+            return f"Цена этого лота — {price} {currency}.".strip()
+        return "Уточните, пожалуйста, цену какого лота нужно проверить."
+
     if lot:
         return "В информации этого лота такой ответ не указан."
     return "В доступной информации продавца такой ответ не указан."
@@ -5960,13 +5981,19 @@ def _handle_smart_router(
                 RUNTIME_STATS["last_decision"] = "AI-router товарный шаблон отклонён: бытовой диалог"
                 return False
             return resolve_and_reroute(f"AI-router: шаблон {rule.get('name')} требует товар")
-        reply = render_reply(str(rule.get("reply", "")), lot, m)
+        reply = render_reply(str(rule.get("reply", "")), lot, m).strip()
+        if not reply:
+            RUNTIME_STATS["last_decision"] = "AI-router: выбран пустой шаблон — AI fallback"
+            return False
         if _send(c, m, reply):
             if product_scope and lot is not None:
                 _remember_resolved_product(getattr(m, "chat_id", ""), lot)
             RUNTIME_STATS["template"] += 1
             RUNTIME_STATS["router_templates"] += 1
             RUNTIME_STATS["last_decision"] = f"AI-шаблон {confidence:.0%}: {rule.get('name')}"
+        # Если непустой шаблон уже дошёл до финального send-gate, повторно
+        # генерировать AI-ответ нельзя: _send мог остановить сообщение из-за
+        # role/automation/privacy race, и fallback не должен обходить этот guard.
         return True
 
     if action == "answer":
@@ -6449,6 +6476,9 @@ def process_buyer_message(
         return
     chat_key = str(getattr(m, "chat_id", "") or "")
     templates_on = bool(SETTINGS.get("templates_enabled", True))
+    # Гибридный режим: шаблон имеет приоритет, но если подходящего непустого
+    # ответа нет, Ollama обязана получить тот же шанс на ответ, что и в AI-only.
+    hybrid_ai_fallback = bool(templates_on and SETTINGS.get("ollama_enabled", True))
 
     # Явная !отмена обрабатывается до privacy/router/product-логики и работает
     # даже без активного pending. Естественные «отмена/неважно» перехватываем
@@ -6538,11 +6568,13 @@ def process_buyer_message(
         basic_rule, basic_score, _basic_phrase = best_basic_template(buyer_text)
         if basic_rule is not None and basic_score >= 0.88:
             _clear_pending_for_independent_message(m, "basic_template")
-            reply = render_reply(str(basic_rule.get("reply") or ""), None, m)
-            if _send(c, m, reply):
-                RUNTIME_STATS["template"] += 1
-                RUNTIME_STATS["last_decision"] = f"базовый шаблон {basic_score:.0%}: {basic_rule.get('name')}"
-            return
+            reply = render_reply(str(basic_rule.get("reply") or ""), None, m).strip()
+            if reply:
+                if _send(c, m, reply):
+                    RUNTIME_STATS["template"] += 1
+                    RUNTIME_STATS["last_decision"] = f"базовый шаблон {basic_score:.0%}: {basic_rule.get('name')}"
+                return
+            RUNTIME_STATS["last_decision"] = "пустой базовый шаблон — AI fallback"
 
     # Общая справка FunPay не является вопросом о конкретном лоте.
     if templates_on and is_auto_delivery_info_question(buyer_text):
@@ -6788,24 +6820,28 @@ def process_buyer_message(
     # 5) В гибридном режиме локальные шаблоны идут раньше AI; в AI-only этот этап пропускается.
     tpl_threshold = float(SETTINGS.get("template_threshold", 0.82))
     if templates_on and effective_rule and rscore >= tpl_threshold:
-        reply = render_reply(str(effective_rule.get("reply", "")), lot, m)
-        if _send(c, m, reply):
-            if product_scope and lot is not None:
-                _remember_resolved_product(chat_key, lot)
-            RUNTIME_STATS["template"] += 1
-            RUNTIME_STATS["last_decision"] = f"шаблон {rscore:.0%}: {effective_rule.get('name')}"
-        return
-
-    if templates_on and SETTINGS.get("prefer_templates_over_ai", True) and effective_rule:
-        soft_threshold = float(SETTINGS.get("template_soft_threshold", 0.72))
-        if rscore >= soft_threshold:
-            reply = render_reply(str(effective_rule.get("reply", "")), lot, m)
+        reply = render_reply(str(effective_rule.get("reply", "")), lot, m).strip()
+        if reply:
             if _send(c, m, reply):
                 if product_scope and lot is not None:
                     _remember_resolved_product(chat_key, lot)
                 RUNTIME_STATS["template"] += 1
-                RUNTIME_STATS["last_decision"] = f"эконом-шаблон {rscore:.0%}: {effective_rule.get('name')}"
+                RUNTIME_STATS["last_decision"] = f"шаблон {rscore:.0%}: {effective_rule.get('name')}"
             return
+        RUNTIME_STATS["last_decision"] = "точный шаблон пуст — AI fallback"
+
+    if templates_on and SETTINGS.get("prefer_templates_over_ai", True) and effective_rule:
+        soft_threshold = float(SETTINGS.get("template_soft_threshold", 0.72))
+        if rscore >= soft_threshold:
+            reply = render_reply(str(effective_rule.get("reply", "")), lot, m).strip()
+            if reply:
+                if _send(c, m, reply):
+                    if product_scope and lot is not None:
+                        _remember_resolved_product(chat_key, lot)
+                    RUNTIME_STATS["template"] += 1
+                    RUNTIME_STATS["last_decision"] = f"эконом-шаблон {rscore:.0%}: {effective_rule.get('name')}"
+                return
+            RUNTIME_STATS["last_decision"] = "мягкий шаблон пуст — AI fallback"
 
     # 6) AI видит либо точно выбранный товар, либо только данные продавца.
     # Публичный профиль обновляется лениво и кешируется; при ошибке сети используется
@@ -6831,7 +6867,14 @@ def process_buyer_message(
 
     # Совместимый старый AI-ответчик используется лишь как резерв.
     ai_threshold = float(SETTINGS.get("ai_threshold", 0.40))
-    ai_allowed = bool(SETTINGS.get("ollama_enabled", True)) and conf >= ai_threshold
+    ai_allowed = bool(SETTINGS.get("ollama_enabled", True)) and (
+        conf >= ai_threshold or hybrid_ai_fallback
+    )
+    if hybrid_ai_fallback and conf < ai_threshold:
+        logger.info(
+            f"{LOG_PREFIX} chat={chat_key} hybrid_ai_fallback=true confidence={conf:.2f} "
+            f"threshold={ai_threshold:.2f}"
+        )
     if ai_allowed:
         blocked, cpu = resource_guard_blocks_ai()
         if blocked:
@@ -6890,12 +6933,15 @@ def process_buyer_message(
     # В AI-only режиме отсутствие/сбой модели не должен превращать очевидный
     # small-talk в бессмысленное «уточните вопрос». Это аварийная диалоговая
     # страховка без seller/product-фактов; при работающем AI она не используется.
-    if not templates_on:
+    if not templates_on or hybrid_ai_fallback:
         safe_dialogue = _safe_ai_only_dialogue_fallback(chat_key, buyer_text)
         if safe_dialogue:
             if _send(c, m, safe_dialogue):
                 RUNTIME_STATS["small_talk"] += 1
-                RUNTIME_STATS["last_decision"] = "AI-only безопасный диалоговый fallback"
+                RUNTIME_STATS["last_decision"] = (
+                    "AI-only безопасный диалоговый fallback"
+                    if not templates_on else "гибридный AI fallback: безопасный диалог"
+                )
             return
 
     _clarify(c, m, product=False)
@@ -7169,9 +7215,10 @@ def init_telegram(cardinal: "Cardinal") -> None:
             f"🛡 Защита от выдуманных фактов: <b>{utils.bool_to_text(SETTINGS.get('strict_grounding', True))}</b>\n"
             f"🧠 Умный роутер: <b>{utils.bool_to_text(SETTINGS.get('smart_router_enabled', True))}</b> · память <b>{SETTINGS.get('max_history', 12)}</b> сообщений\n"
             f"🧩 Все шаблоны: <b>{utils.bool_to_text(SETTINGS.get('templates_enabled', True))}</b>\n"
+            f"🤖 Шаблон → AI fallback: <b>{utils.bool_to_text(SETTINGS.get('templates_enabled', True) and SETTINGS.get('ollama_enabled', True))}</b>\n"
             f"🔄 Обновления: <b>{utils.escape(update_status_line())}</b>\n\n"
             + (
-                "Гибридный режим: сначала безопасные локальные шаблоны и точное определение лота, затем AI."
+                "Гибридный режим: сначала безопасные шаблоны; если подходящего ответа нет — AI продолжает обработку как в AI-only."
                 if SETTINGS.get("templates_enabled", True) else
                 "AI-only: содержательные ответы формирует нейросеть; код только определяет лот, запрашивает обязательные уточнения и проверяет факты."
             )
@@ -7219,10 +7266,11 @@ def init_telegram(cardinal: "Cardinal") -> None:
             "нужен ли ответ, уточнение товара или живой продавец.\n\n"
             f"🧩 Все шаблонные ответы: <b>{utils.bool_to_text(SETTINGS.get('templates_enabled', True))}</b>\n"
             f"🧩 Смысловой выбор шаблонов AI: <b>{utils.bool_to_text(SETTINGS.get('ai_template_router_enabled', True) and SETTINGS.get('templates_enabled', True))}</b>\n"
+            f"🤖 Шаблон → AI fallback: <b>{utils.bool_to_text(SETTINGS.get('templates_enabled', True) and SETTINGS.get('ollama_enabled', True))}</b>\n"
             + (
                 "🤖 <b>Режим:</b> AI-only — модель формулирует содержательные ответы сама; обязательное уточнение лота остаётся защитой от выдумок.\n"
                 if not SETTINGS.get("templates_enabled", True) else
-                "🤝 <b>Режим:</b> гибридный — точные шаблоны могут отвечать до AI.\n"
+                "🤝 <b>Режим:</b> гибридный — точный шаблон отвечает первым; если не подошёл, диалог продолжает AI.\n"
             )
             + f"🤫 Отвечать только когда нужно: <b>{utils.bool_to_text(SETTINGS.get('reply_only_when_needed', True))}</b>\n"
             f"🎯 Только заданный вопрос, без лишних сведений: <b>{utils.bool_to_text(SETTINGS.get('answer_only_asked', True))}</b>\n"
@@ -8581,7 +8629,7 @@ def init_telegram(cardinal: "Cardinal") -> None:
     def help_page(call: CallbackQuery) -> None:
         kb = K().add(B("◀️ Назад", callback_data=f"{CBT_PREFIX}:main"))
         text = (
-            "📖 <b>Как работает Hybrid AI AutoReply v2.5.6</b>\n\n"
+            "📖 <b>Как работает Hybrid AI AutoReply v2.5.7</b>\n\n"
             "1️⃣ Сообщения одного чата ставятся в отдельную FIFO-очередь и обрабатываются строго по порядку. "
             "Более поздняя реплика не попадает в контекст первого ответа.\n"
             "2️⃣ В <b>🧠 AI-логика / Промпт</b> есть главный переключатель <b>🧩 Все шаблоны</b>. "

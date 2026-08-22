@@ -54,10 +54,11 @@ if TYPE_CHECKING:
 # Метаданные плагина
 # ============================================================================
 NAME = "Hybrid AI AutoReply 🤖 | @revengezza"
-VERSION = "2.5.5"
+VERSION = "2.5.6"
 DESCRIPTION = (
-    "Умный AI-заместитель продавца FunPay v2.5.5: ведёт связный AI-only диалог независимо от шаблонов, "
-    "помнит безопасную хронологию прошлых запросов, понимает короткие продолжения и отвечает на бытовой small-talk. "
+    "Умный AI-заместитель продавца FunPay v2.5.6: ведёт связный AI-only диалог независимо от шаблонов, "
+    "не путает бытовой small-talk с лотами даже при fuzzy-совпадениях в описаниях, помнит безопасную хронологию "
+    "прошлых запросов и понимает короткие продолжения. "
     "Факты берутся только из подтверждённых seller/product/buyer-источников; история хранится уже очищенной, "
     "конфиденциальные данные и контакты отсекаются до AI, в логах и перед отправкой, а seller-only role guard "
     "не даёт плагину отвечать, пока покупка текущего аккаунта активна; после подтверждения такой заказ больше не блокирует чат. Для вручную отмеченных автотоваров "
@@ -1791,6 +1792,11 @@ def _lot_candidate_texts(lot: dict[str, Any]) -> list[tuple[str, float]]:
 
 def _has_explicit_product_reference(text: str) -> bool:
     """Есть ли в сообщении признаки именно названия/варианта товара, а не только вопрос о свойстве."""
+    # Чистый бытовой диалог никогда не является названием товара. Это отдельный
+    # hard-guard от совпадений вроде «привет» со словом из full_description лота.
+    # Смешанные сообщения («спасибо, а сколько стоит ...?») сюда не попадают.
+    if _is_obvious_non_product_dialogue("", text):
+        return False
     q = _product_tokens(text)
     if not q:
         return False
@@ -2148,6 +2154,12 @@ def _last_resolved_product(chat_id: Any) -> dict[str, Any] | None:
 
 def resolve_product(c: "Cardinal", m: Any, text: str, force_viewing: bool = False) -> tuple[dict[str, Any] | None, float, str]:
     chat_key = str(getattr(m, "chat_id", ""))
+
+    # Чистый small-talk / presence не должен получать даже текущий buyer_viewing:
+    # «привет» остаётся приветствием, даже если покупатель в этот момент открыл лот.
+    # Но «спасибо, а сколько стоит X?» сохраняет бизнес-интент и ищет X нормально.
+    if _is_obvious_non_product_dialogue(chat_key, text):
+        return None, 0.0, "dialogue_non_product"
 
     # 0) Продолжение разговора «этого лота / данного товара». Если покупатель
     # не назвал новый товар, ссылка относится к последнему товару, по которому
@@ -3728,9 +3740,9 @@ def presence_reply() -> str:
 # ============================================================================
 # Локальный small-talk
 # ============================================================================
-# Такие сообщения не должны попадать в товарный fuzzy-анализ или в Ollama.
-# Это одновременно быстрее и не дает маленьким моделям отвечать нелепыми
-# уточнениями на обычное «как дела?».
+# Такие сообщения никогда не должны попадать в товарный fuzzy-анализ.
+# В гибридном режиме они могут обслуживаться локально, а в AI-only — идти в
+# Ollama как обычный диалог без product-context.
 _SMALL_TALK_WELLBEING_RE = re.compile(
     r"(?:\bкак\s+(?:у\s+(?:тебя|вас)\s+)?дела(?:\s+у\s+(?:тебя|вас))?$|\bкак\s+жизнь$|"
     r"\bкак\s+пожива\w*$|\bкак\s+настроен\w*$|\bкак\s+(?:сам(?:а)?|сами)$)",
@@ -3759,10 +3771,14 @@ _SMALL_TALK_GREETING_RE = re.compile(
 )
 
 
-def local_small_talk_reply(text: str) -> tuple[str, str, str] | None:
-    """Возвращает (тип, system_key, резервный ответ) для базового шаблона."""
-    if not SETTINGS.get("small_talk_enabled", True):
-        return None
+def _detect_small_talk_reply(text: str) -> tuple[str, str, str] | None:
+    """Распознаёт очевидный бытовой диалог независимо от настройки шаблонов.
+
+    Важно отделять распознавание смысла от ``small_talk_enabled``: даже когда
+    владелец выключил готовые шаблоны и хочет отвечать только через AI, слово
+    «привет» не должно становиться названием лота из-за fuzzy-совпадения с
+    длинным описанием товара.
+    """
     n = normalize_text(text)
     if not n:
         return None
@@ -3779,6 +3795,13 @@ def local_small_talk_reply(text: str) -> tuple[str, str, str] | None:
     if _SMALL_TALK_GREETING_RE.search(n):
         return "приветствие", "greeting", "Здравствуйте! 👋 Чем могу помочь?"
     return None
+
+
+def local_small_talk_reply(text: str) -> tuple[str, str, str] | None:
+    """Возвращает small-talk для локального шаблона, если функция включена."""
+    if not SETTINGS.get("small_talk_enabled", True):
+        return None
+    return _detect_small_talk_reply(text)
 
 
 _DIALOGUE_WELLBEING_FOLLOWUP_RE = re.compile(
@@ -3818,7 +3841,7 @@ def _dialogue_small_talk_kind(chat_id: Any, text: str) -> str:
     n = normalize_text(text)
     if not n:
         return ""
-    basic = local_small_talk_reply(text)
+    basic = _detect_small_talk_reply(text)
     if basic is not None:
         system_key = basic[1]
         if system_key == "wellbeing":
@@ -3837,6 +3860,31 @@ def _dialogue_small_talk_kind(chat_id: Any, text: str) -> str:
     ):
         return "status_reply"
     return ""
+
+
+def _is_obvious_non_product_dialogue(chat_id: Any, text: str) -> bool:
+    """True только для самостоятельной бытовой реплики без делового вопроса.
+
+    Нужен как semantic firewall перед fuzzy-поиском. В отличие от простого
+    ``small_talk != None`` учитывает смешанные фразы: «спасибо, а цена X?»
+    остаётся товарным вопросом, а «привет» / «как дела?» — нет.
+    """
+    if is_presence_question(text):
+        return True
+    if not _dialogue_small_talk_kind(chat_id, text):
+        return False
+    business = bool(
+        is_quantity_purchase_question(text)
+        or is_price_question(text)
+        or is_purchase_permission_question(text)
+        or _looks_like_natural_availability_question(text)
+        or looks_product_dependent(text)
+        or looks_seller_profile_question(text)
+        or is_seller_lot_count_question(text)
+        or is_seller_trust_question(text)
+        or is_seller_summon_question(text)
+    )
+    return not business
 
 
 def _dialogue_reply_guard(chat_id: Any, buyer_text: str, answer: str, intent: str = "") -> tuple[str, str]:
@@ -5801,6 +5849,7 @@ def _handle_smart_router(
 
     lot: dict[str, Any] | None = forced_lot if product_scope else None
     product_source = str(resolved_source or ("forced" if forced_lot else "seller_scope"))
+    dialogue_signal = _is_obvious_non_product_dialogue(getattr(m, "chat_id", ""), buyer_text)
 
     def request_product_context(reason: str, source: str = product_source) -> None:
         max_candidates = max(1, min(5, int(SETTINGS.get("product_clarify_max_candidates", 5))))
@@ -5842,10 +5891,6 @@ def _handle_smart_router(
             return False
         # Маленькая модель не должна потерять очевидный вопрос.
         guard_rule, guard_score, _guard_phrase = best_rule(buyer_text)
-        dialogue_signal = bool(
-            is_presence_question(buyer_text)
-            or _dialogue_small_talk_kind(getattr(m, "chat_id", ""), buyer_text)
-        )
         obvious_question = (
             looks_like_question(buyer_text)
             or looks_seller_profile_question(buyer_text)
@@ -5885,6 +5930,10 @@ def _handle_smart_router(
         return True
 
     if action == "clarify_product":
+        if dialogue_signal:
+            # Ошибка модели на бытовой реплике не имеет права запускать выбор лота.
+            RUNTIME_STATS["last_decision"] = "AI-router clarify_product отклонён: бытовой диалог"
+            return False
         if is_seller_lot_count_question(buyer_text):
             # Этот вопрос относится ко всему каталогу продавца. Даже если маленькая
             # модель ошибочно увидела слово «товар» и попросила product-context,
@@ -5907,6 +5956,9 @@ def _handle_smart_router(
             RUNTIME_STATS["last_decision"] = "AI-router: неизвестный id шаблона — fallback"
             return False
         if bool(rule.get("requires_product")) and lot is None:
+            if dialogue_signal:
+                RUNTIME_STATS["last_decision"] = "AI-router товарный шаблон отклонён: бытовой диалог"
+                return False
             return resolve_and_reroute(f"AI-router: шаблон {rule.get('name')} требует товар")
         reply = render_reply(str(rule.get("reply", "")), lot, m)
         if _send(c, m, reply):
@@ -5919,6 +5971,11 @@ def _handle_smart_router(
 
     if action == "answer":
         if decision.get("needs_product") and lot is None:
+            if dialogue_signal:
+                # Не доверяем needs_product на очевидном small-talk; пусть обычный
+                # AI fallback сформулирует ответ без товарного контекста.
+                RUNTIME_STATS["last_decision"] = "AI-router needs_product отклонён: бытовой диалог"
+                return False
             if is_seller_lot_count_question(buyer_text):
                 reply = seller_lot_count_reply(c)
                 if _send(c, m, reply):
@@ -6434,35 +6491,46 @@ def process_buyer_message(
         or is_price_question(buyer_text)
         or is_purchase_permission_question(buyer_text)
         or looks_product_dependent(buyer_text)
+        or _looks_like_natural_availability_question(buyer_text)
         or looks_seller_profile_question(buyer_text)
         or seller_lot_count_intent
         or is_seller_trust_question(buyer_text)
         or is_seller_summon_question(buyer_text)
     )
 
-    # 1) В гибридном режиме простое общение сначала проходит через редактируемые шаблоны.
-    small_talk = local_small_talk_reply(buyer_text)
-    if templates_on and small_talk is not None and not business_intent:
-        kind, system_key, fallback = small_talk
-        reply = configured_basic_reply(system_key, fallback)
-        if reply is not None:
-            _clear_pending_for_independent_message(m, "small_talk")
-            if _send(c, m, reply):
-                RUNTIME_STATS["small_talk"] += 1
-                RUNTIME_STATS["template"] += 1
-                RUNTIME_STATS["last_decision"] = f"базовый шаблон: {kind}"
-                logger.info(f"{LOG_PREFIX} chat={chat_key} local_small_talk={kind}")
-            return
+    # 1) Смысл small-talk распознаём независимо от пользовательских шаблонов.
+    # В AI-only это НЕ отправляет готовый шаблон, а лишь запрещает товарному fuzzy
+    # перехватывать «привет», «как дела», «спасибо» и похожие самостоятельные реплики.
+    detected_small_talk = _detect_small_talk_reply(buyer_text)
+    presence_intent = is_presence_question(buyer_text)
+    non_product_dialogue_intent = _is_obvious_non_product_dialogue(chat_key, buyer_text)
+    dialogue_only_intent = detected_small_talk is not None and non_product_dialogue_intent and not presence_intent
 
-    if templates_on and is_presence_question(buyer_text):
-        reply = configured_basic_reply("presence", presence_reply())
-        if reply is not None:
-            _clear_pending_for_independent_message(m, "presence")
-            if _send(c, m, reply):
-                RUNTIME_STATS["template"] += 1
-                RUNTIME_STATS["last_decision"] = "базовый шаблон: на связи"
-                logger.info(f"{LOG_PREFIX} chat={chat_key} local_presence=true")
-            return
+    if non_product_dialogue_intent:
+        _clear_pending_for_independent_message(m, "small_talk" if detected_small_talk is not None else "dialogue_followup")
+
+    if dialogue_only_intent:
+        small_talk = local_small_talk_reply(buyer_text)
+        if templates_on and small_talk is not None:
+            kind, system_key, fallback = small_talk
+            reply = configured_basic_reply(system_key, fallback)
+            if reply is not None:
+                if _send(c, m, reply):
+                    RUNTIME_STATS["small_talk"] += 1
+                    RUNTIME_STATS["template"] += 1
+                    RUNTIME_STATS["last_decision"] = f"базовый шаблон: {kind}"
+                    logger.info(f"{LOG_PREFIX} chat={chat_key} local_small_talk={kind}")
+                return
+
+    if presence_intent:
+        if templates_on:
+            reply = configured_basic_reply("presence", presence_reply())
+            if reply is not None:
+                if _send(c, m, reply):
+                    RUNTIME_STATS["template"] += 1
+                    RUNTIME_STATS["last_decision"] = "базовый шаблон: на связи"
+                    logger.info(f"{LOG_PREFIX} chat={chat_key} local_presence=true")
+                return
 
     # Дополнительные пользовательские фразы базовых шаблонов тоже имеют приоритет,
     # но только при почти точном совпадении и отсутствии делового вопроса.
@@ -6617,6 +6685,7 @@ def process_buyer_message(
     requires_product = bool(effective_rule and effective_rule.get("requires_product"))
     product_text_signal = (
         not seller_lot_count_intent
+        and not non_product_dialogue_intent
         and (
             requires_product
             or looks_product_dependent(buyer_text)
@@ -6631,7 +6700,10 @@ def process_buyer_message(
         except Exception:
             logger.debug(f"{LOG_PREFIX} Не удалось обновить лоты перед определением товара.", exc_info=True)
 
-    catalog_signal, catalog_ranked = _catalog_reference_signal(buyer_text)
+    if non_product_dialogue_intent:
+        catalog_signal, catalog_ranked = False, []
+    else:
+        catalog_signal, catalog_ranked = _catalog_reference_signal(buyer_text)
     strong_catalog_match = bool(catalog_ranked and _product_match_is_confident(buyer_text, catalog_ranked))
 
     # Разговорное «есть <название лота>?» должно означать наличие, но только
@@ -6654,6 +6726,8 @@ def process_buyer_message(
         and (requires_product or looks_product_dependent(buyer_text) or context_product_reference)
     )
     product_scope = forced_lot is not None or product_intent or catalog_signal
+    if forced_lot is None and non_product_dialogue_intent:
+        product_scope = False
 
     # «Сколько товаров/лотов у продавца?» — вопрос о каталоге продавца целиком,
     # а не о свойствах одного товара. Особенно важно в AI-only: слова «товаров»
@@ -8507,7 +8581,7 @@ def init_telegram(cardinal: "Cardinal") -> None:
     def help_page(call: CallbackQuery) -> None:
         kb = K().add(B("◀️ Назад", callback_data=f"{CBT_PREFIX}:main"))
         text = (
-            "📖 <b>Как работает Hybrid AI AutoReply v2.5.5</b>\n\n"
+            "📖 <b>Как работает Hybrid AI AutoReply v2.5.6</b>\n\n"
             "1️⃣ Сообщения одного чата ставятся в отдельную FIFO-очередь и обрабатываются строго по порядку. "
             "Более поздняя реплика не попадает в контекст первого ответа.\n"
             "2️⃣ В <b>🧠 AI-логика / Промпт</b> есть главный переключатель <b>🧩 Все шаблоны</b>. "

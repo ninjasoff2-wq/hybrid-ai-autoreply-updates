@@ -1,9 +1,9 @@
 {
   "schema": 1,
   "uuid": "b32e7a16-0fb6-4e78-96d2-9a2eb5d8a401",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "download_url": "https://raw.githubusercontent.com/ninjasoff2-wq/hybrid-ai-autoreply-updates/main/updates/hybrid_ai/hybrid_ai_autoreply.py",
-  "sha256": "1075e41866577a60600a860b7b9fcfcf44e5495d64dc618b4ceece0bd3937efe",
+  "sha256": "c151d01a80df26416ca4c64d33e9a0dc6d11e0542c05c843e7512426f70dd745",
   "mandatory": false,
-  "notes": "Hybrid AI AutoReply 2.4.0: смысловая маршрутизация, обязательный privacy-guard до AI и перед отправкой, безопасные отказы по правилам FunPay."
+  "notes": "Hybrid AI AutoReply 2.4.1: !отмена для сброса выбора товара и исправление seller-wide вопросов о количестве лотов без повторного product_clarify."
 }

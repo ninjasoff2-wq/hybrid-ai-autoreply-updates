@@ -1,9 +1,9 @@
 {
   "schema": 1,
   "uuid": "b32e7a16-0fb6-4e78-96d2-9a2eb5d8a401",
-  "version": "2.4.2",
+  "version": "2.5.2",
   "download_url": "https://raw.githubusercontent.com/ninjasoff2-wq/hybrid-ai-autoreply-updates/main/updates/hybrid_ai/hybrid_ai_autoreply.py",
-  "sha256": "a22ed77d38fb941a6ef01e23f6c6488af0d238fdc910a8cf8bab3effbefa9ee4",
+  "sha256": "600f3f313cd01a76680a2a738b8e4e46aab2f57ba46e44a46520b09cf6ca0669",
   "mandatory": false,
-  "notes": "Hybrid AI AutoReply 2.4.2: связный диалог, безопасный bootstrap истории FunPay и guard от бессмысленного small-talk."
+  "notes": "Hybrid AI AutoReply 2.5.2: расширенная нормализация Telegram/TG/ТГ, диалоговые fixes и усиленный privacy/policy guard."
 }

@@ -54,13 +54,13 @@ if TYPE_CHECKING:
 # Метаданные плагина
 # ============================================================================
 NAME = "Hybrid AI AutoReply 🤖 | @revengezza"
-VERSION = "2.5.4"
+VERSION = "2.5.5"
 DESCRIPTION = (
-    "Умный AI-заместитель продавца FunPay v2.5.4: ведёт связный AI-only диалог независимо от шаблонов, "
+    "Умный AI-заместитель продавца FunPay v2.5.5: ведёт связный AI-only диалог независимо от шаблонов, "
     "помнит безопасную хронологию прошлых запросов, понимает короткие продолжения и отвечает на бытовой small-talk. "
     "Факты берутся только из подтверждённых seller/product/buyer-источников; история хранится уже очищенной, "
     "конфиденциальные данные и контакты отсекаются до AI, в логах и перед отправкой, а seller-only role guard "
-    "не даёт плагину отвечать в buyer-сделках текущего аккаунта. Для вручную отмеченных автотоваров "
+    "не даёт плагину отвечать, пока покупка текущего аккаунта активна; после подтверждения такой заказ больше не блокирует чат. Для вручную отмеченных автотоваров "
     "AI автоматически блокируется на время заказа, чтобы не мешать отдельной автовыдаче. Автор / ТГК: @revengezza"
 )
 CREDITS = "Автор / ТГК: @revengezza"
@@ -492,8 +492,8 @@ CHAT_QUEUE_ACTIVE: set[str] = set()
 # Роль аккаунта в конкретном чате. Это runtime-cache: на диск не пишется и
 # после рестарта заново восстанавливается из системных сообщений FunPay.
 # Важный invariant: если в чате обнаружена покупка от имени текущего аккаунта,
-# seller-autoreply там блокируется до подтверждения и остаётся выключенным, пока
-# не появится более новое достоверное seller-side событие.
+# seller-autoreply там блокируется, пока эта покупка активна. После подтверждения
+# / полного возврата исторический buyer-role сам по себе чат больше не глушит.
 CHAT_ROLE_STATE: dict[str, dict[str, Any]] = {}
 CHAT_ROLE_BOOTSTRAPPED: set[str] = set()
 # Короткий race-guard между системным ORDER_PURCHASED и NewOrderEvent: если
@@ -3239,6 +3239,11 @@ def _new_chat_role_state() -> dict[str, Any]:
         "active_buyer_orders": set(),
         "buyer_active_unknown": False,
         "order_roles": {},
+        # ID системного сообщения, после которого последняя buyer-покупка
+        # текущего аккаунта уже закрыта. Нужен не для блокировки, а чтобы
+        # после рестарта не импортировать в seller AI-memory переписку из
+        # периода, когда аккаунт сам был покупателем.
+        "buyer_history_after_id": "",
         "checked_at": 0.0,
         "check_failed": False,
         "reason": "unknown",
@@ -3271,6 +3276,13 @@ def _apply_transaction_role_message(c: "Cardinal", state: dict[str, Any], item: 
             active.discard(order_id)
         else:
             state["buyer_active_unknown"] = False
+        # Требование seller-only guard: молчим, пока НАША покупка активна.
+        # После подтверждения / закрытия последней нашей покупки чат снова
+        # может использоваться для обычного общения или будущей продажи.
+        # При этом старую buyer-переписку не подмешиваем в AI-memory: ниже
+        # bootstrap начнёт импорт только после этого системного сообщения.
+        if not active and not state.get("buyer_active_unknown"):
+            state["buyer_history_after_id"] = str(getattr(item, "id", "") or "")
         state["reason"] = "buyer_chat_closed_order"
     elif type_name == "ORDER_REOPENED":
         known_role = role or (order_roles.get(order_id) if order_id else None)
@@ -3291,12 +3303,16 @@ def _apply_transaction_role_message(c: "Cardinal", state: dict[str, Any], item: 
 
 
 def _role_state_blocks(state: dict[str, Any] | None) -> tuple[bool, str]:
+    """Блокирует Hybrid AI только пока покупка текущего аккаунта активна.
+
+    Исторический ``latest_role == buyer`` сам по себе не является причиной
+    вечной блокировки: после подтверждения/возврата закрытая покупка не должна
+    мешать обычному общению с тем же пользователем или его будущей покупке у нас.
+    """
     state = state or {}
     active = state.get("active_buyer_orders") or set()
     if active or state.get("buyer_active_unknown"):
         return True, "buyer_order_active"
-    if state.get("latest_role") == "buyer":
-        return True, "buyer_chat"
     return False, ""
 
 
@@ -3438,12 +3454,20 @@ def _chat_autoreply_allowed(c: "Cardinal", m: Any, force_refresh: bool = False) 
     state = _refresh_chat_role_state(c, m, force=force_refresh) if needs_refresh else CHAT_ROLE_STATE.get(chat_key)
 
     # Незавершённая покупка текущего аккаунта имеет абсолютный приоритет и
-    # buyer_viewing её не перебивает. Но после закрытия старой buyer-сделки
-    # реальный «Покупатель смотрит ваш лот» является сильным новым seller-side
-    # сигналом и позволяет корректно сменить направление общения с тем же юзером.
+    # buyer_viewing её не перебивает. Если RAM-кэш говорит, что такая покупка
+    # активна, перед отказом один раз перечитываем историю: Cardinal мог
+    # пропустить ORDER_CONFIRMED, пока плагин/runner перезапускался или лагал.
+    # Ошибка refresh безопасна: старый active marker остаётся и ответ не уйдёт.
     active_buyer = bool((state or {}).get("active_buyer_orders") or (state or {}).get("buyer_active_unknown"))
+    if active_buyer and not force_refresh:
+        state = _refresh_chat_role_state(c, m, force=True)
+        active_buyer = bool((state or {}).get("active_buyer_orders") or (state or {}).get("buyer_active_unknown"))
     if active_buyer:
         return False, "buyer_order_active"
+
+    # После закрытия старой buyer-сделки реальный «Покупатель смотрит ваш лот»
+    # является сильным seller-side сигналом и позволяет корректно сменить
+    # направление общения с тем же пользователем.
     if viewing_is_seller_signal:
         with LOCK:
             state = state or _new_chat_role_state()
@@ -3570,10 +3594,26 @@ def _bootstrap_chat_history(c: "Cardinal", m: Any, current_text: str) -> None:
         # и показать модели более позднюю реплику покупателя.
         return
 
+    # Если ранее этот аккаунт был покупателем и уже закрыл свою покупку,
+    # не переносим в seller AI-memory старую buyer-side переписку. Разрешаем
+    # новый диалог, но его хронология начинается ПОСЛЕ сообщения о закрытии.
+    history_start = 0
+    buyer_history_after_id = str((state or {}).get("buyer_history_after_id") or "")
+    if buyer_history_after_id:
+        boundary_found = False
+        for i, item in enumerate(messages[:cutoff]):
+            if str(getattr(item, "id", "") or "") == buyer_history_after_id:
+                history_start = i + 1
+                boundary_found = True
+        if not boundary_found and (state or {}).get("latest_role") == "buyer":
+            # Не нашли надёжную границу — лучше начать память с текущего входа,
+            # чем скормить модели контекст, где владелец сам был покупателем.
+            history_start = cutoff
+
     imported: list[dict[str, str]] = []
     # Берём больше, чем непосредственно уйдёт в messages[], чтобы компактная
     # buyer-memory могла помнить несколько более ранних запросов после рестарта.
-    for item in messages[:cutoff][-_history_store_limit() * 2:]:
+    for item in messages[history_start:cutoff][-_history_store_limit() * 2:]:
         role = _history_message_role(c, item)
         text = _safe_history_content(getattr(item, "text", ""))
         if role not in {"user", "assistant"} or not text:
@@ -8467,7 +8507,7 @@ def init_telegram(cardinal: "Cardinal") -> None:
     def help_page(call: CallbackQuery) -> None:
         kb = K().add(B("◀️ Назад", callback_data=f"{CBT_PREFIX}:main"))
         text = (
-            "📖 <b>Как работает Hybrid AI AutoReply v2.5.4</b>\n\n"
+            "📖 <b>Как работает Hybrid AI AutoReply v2.5.5</b>\n\n"
             "1️⃣ Сообщения одного чата ставятся в отдельную FIFO-очередь и обрабатываются строго по порядку. "
             "Более поздняя реплика не попадает в контекст первого ответа.\n"
             "2️⃣ В <b>🧠 AI-логика / Промпт</b> есть главный переключатель <b>🧩 Все шаблоны</b>. "

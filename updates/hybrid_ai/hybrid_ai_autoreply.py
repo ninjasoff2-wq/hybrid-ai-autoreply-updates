@@ -54,13 +54,14 @@ if TYPE_CHECKING:
 # Метаданные плагина
 # ============================================================================
 NAME = "Hybrid AI AutoReply 🤖 | @revengezza"
-VERSION = "2.5.2"
+VERSION = "2.5.4"
 DESCRIPTION = (
-    "Умный AI-заместитель продавца FunPay v2.5.2: ведёт связный AI-only диалог независимо от шаблонов, "
+    "Умный AI-заместитель продавца FunPay v2.5.4: ведёт связный AI-only диалог независимо от шаблонов, "
     "помнит безопасную хронологию прошлых запросов, понимает короткие продолжения и отвечает на бытовой small-talk. "
     "Факты берутся только из подтверждённых seller/product/buyer-источников; история хранится уже очищенной, "
-    "конфиденциальные данные и контакты отсекаются до AI, в логах и перед отправкой, а нарушения правил FunPay "
-    "получают безопасный отказ. Автор / ТГК: @revengezza"
+    "конфиденциальные данные и контакты отсекаются до AI, в логах и перед отправкой, а seller-only role guard "
+    "не даёт плагину отвечать в buyer-сделках текущего аккаунта. Для вручную отмеченных автотоваров "
+    "AI автоматически блокируется на время заказа, чтобы не мешать отдельной автовыдаче. Автор / ТГК: @revengezza"
 )
 CREDITS = "Автор / ТГК: @revengezza"
 AUTHOR = "@revengezza"
@@ -378,7 +379,7 @@ def _migrate_system_rules(rules: list[Any]) -> list[dict[str, Any]]:
 
 
 DEFAULTS: dict[str, Any] = {
-    "version": 21,
+    "version": 22,
     "enabled": True,
     "setup_done": False,
     "ollama_enabled": True,
@@ -459,6 +460,14 @@ DEFAULTS: dict[str, Any] = {
     ),
     "rules": _default_rules(),
     "lot_notes": {},
+    # Ручные метки автосценариев. Это НЕ автоопределение FunPay: владелец сам
+    # решает, на каких лотах Hybrid AI должен замолчать после покупки.
+    # lid -> {"enabled": bool, "release": "order_closed" | "manual"}
+    "automation_lots": {},
+    # Переживающие перезапуск состояния заказов, для которых Hybrid AI был
+    # отключен. Хранят только технические ID/время, без текста покупателей и
+    # без каких-либо секретов заказа.
+    "automation_order_locks": {},
 }
 
 SETTINGS: dict[str, Any] = copy.deepcopy(DEFAULTS)
@@ -480,6 +489,18 @@ SELLER_NOTIFY_AT: dict[str, float] = {}
 CHAT_LOCKS: dict[str, threading.Lock] = {}
 CHAT_QUEUES: dict[str, deque[tuple["Cardinal", Any, str]]] = {}
 CHAT_QUEUE_ACTIVE: set[str] = set()
+# Роль аккаунта в конкретном чате. Это runtime-cache: на диск не пишется и
+# после рестарта заново восстанавливается из системных сообщений FunPay.
+# Важный invariant: если в чате обнаружена покупка от имени текущего аккаунта,
+# seller-autoreply там блокируется до подтверждения и остаётся выключенным, пока
+# не появится более новое достоверное seller-side событие.
+CHAT_ROLE_STATE: dict[str, dict[str, Any]] = {}
+CHAT_ROLE_BOOTSTRAPPED: set[str] = set()
+# Короткий race-guard между системным ORDER_PURCHASED и NewOrderEvent: если
+# хотя бы один лот вручную отмечен как автоматизированный, на несколько
+# миллисекунд/секунд не даём AI вмешаться, пока NewOrderEvent не сообщит точный
+# lot_id. Pending хранится только в RAM и снимается авторитетным событием заказа.
+AUTOMATION_PENDING_SALES: dict[str, dict[str, Any]] = {}
 VIEWING_CACHE: dict[str, tuple[float, Any]] = {}
 PROCESSED_MESSAGES: dict[str, float] = {}
 OLLAMA_STATUS_CACHE: dict[str, Any] = {"at": 0.0, "data": None}
@@ -511,6 +532,9 @@ RUNTIME_STATS: dict[str, Any] = {
     "seller_calls": 0,
     "uncertain_answers": 0,
     "privacy_blocks": 0,
+    "role_blocks": 0,
+    "automation_blocks": 0,
+    "automation_locks_created": 0,
     "last_decision": "—",
 }
 
@@ -551,6 +575,10 @@ def load_config() -> None:
         SETTINGS["rules"] = _default_rules()
     if not isinstance(SETTINGS.get("lot_notes"), dict):
         SETTINGS["lot_notes"] = {}
+    if not isinstance(SETTINGS.get("automation_lots"), dict):
+        SETTINGS["automation_lots"] = {}
+    if not isinstance(SETTINGS.get("automation_order_locks"), dict):
+        SETTINGS["automation_order_locks"] = {}
     if not isinstance(SETTINGS.get("facts"), list):
         SETTINGS["facts"] = []
 
@@ -706,6 +734,12 @@ def load_config() -> None:
         SETTINGS.setdefault("dialogue_guard_enabled", True)
         SETTINGS.setdefault("history_bootstrap_enabled", True)
         SETTINGS["version"] = 21
+    if cfg_version < 22:
+        # v2.5.4: ручная маркировка лотов, которыми управляет отдельная
+        # автовыдача/автосценарий. Hybrid AI блокируется только на таких заказах.
+        SETTINGS.setdefault("automation_lots", {})
+        SETTINGS.setdefault("automation_order_locks", {})
+        SETTINGS["version"] = 22
     save_config()
 
 
@@ -2720,6 +2754,735 @@ def add_history(chat_id: Any, role: str, content: str) -> None:
         CHAT_HISTORY[key] = CHAT_HISTORY[key][-max_keep:]
 
 
+# ============================================================================
+# Per-order AI lock for manually selected auto-delivery / automation lots
+# ============================================================================
+_AUTOMATION_RELEASE_POLICIES = {"order_closed", "workflow_done", "manual"}
+_AUTOMATION_CLOSE_NAMES = {"ORDER_CONFIRMED", "ORDER_CONFIRMED_BY_ADMIN", "REFUND", "REFUND_BY_ADMIN"}
+
+
+def _automation_lots_cfg() -> dict[str, Any]:
+    cfg = SETTINGS.get("automation_lots")
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _automation_lot_policy(lot_id: Any) -> dict[str, Any]:
+    lid = str(lot_id or "").strip()
+    raw = _automation_lots_cfg().get(lid)
+    if raw is True:
+        return {"enabled": True, "release": "order_closed"}
+    if not isinstance(raw, dict):
+        return {"enabled": False, "release": "order_closed"}
+    release = str(raw.get("release") or "order_closed")
+    if release not in _AUTOMATION_RELEASE_POLICIES:
+        release = "order_closed"
+    return {"enabled": bool(raw.get("enabled", True)), "release": release}
+
+
+def _automation_lot_enabled(lot_id: Any) -> bool:
+    return bool(_automation_lot_policy(lot_id).get("enabled"))
+
+
+def _automation_any_marked_lots() -> bool:
+    return any(_automation_lot_enabled(lid) for lid in _automation_lots_cfg())
+
+
+def _automation_order_key(order_id: Any, chat_id: Any = "", lot_id: Any = "") -> str:
+    oid = str(order_id or "").strip().lstrip("#").upper()
+    if oid:
+        return oid
+    seed = f"{chat_id}|{lot_id}|{time.time_ns()}"
+    return "TMP" + hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:12].upper()
+
+
+def _automation_lock_records() -> dict[str, Any]:
+    records = SETTINGS.get("automation_order_locks")
+    if not isinstance(records, dict):
+        records = {}
+        SETTINGS["automation_order_locks"] = records
+    return records
+
+
+def _prune_automation_lock_records(max_inactive: int = 300, max_age_days: int = 180) -> None:
+    """Не даёт технической истории закрытых automation-order бесконечно расти."""
+    now = time.time()
+    max_age = max(1, int(max_age_days)) * 86400
+    with LOCK:
+        records = _automation_lock_records()
+        inactive: list[tuple[str, float]] = []
+        for key, raw in list(records.items()):
+            if not isinstance(raw, dict):
+                records.pop(key, None)
+                continue
+            if raw.get("active"):
+                continue
+            updated = float(raw.get("updated_at") or raw.get("released_at") or raw.get("created_at") or 0)
+            if updated and now - updated > max_age:
+                records.pop(key, None)
+                continue
+            inactive.append((str(key), updated))
+        inactive.sort(key=lambda item: item[1], reverse=True)
+        for key, _ in inactive[max(0, int(max_inactive)):]:
+            records.pop(key, None)
+
+
+def _automation_active_records(chat_id: Any | None = None, lot_id: Any | None = None) -> list[tuple[str, dict[str, Any]]]:
+    chat_key = None if chat_id is None else str(chat_id)
+    lot_key = None if lot_id is None else str(lot_id)
+    result: list[tuple[str, dict[str, Any]]] = []
+    with LOCK:
+        for key, raw in _automation_lock_records().items():
+            if not isinstance(raw, dict) or not raw.get("active"):
+                continue
+            if chat_key is not None and str(raw.get("chat_id") or "") != chat_key:
+                continue
+            if lot_key is not None and str(raw.get("lot_id") or "") != lot_key:
+                continue
+            result.append((str(key), copy.deepcopy(raw)))
+    result.sort(key=lambda item: float(item[1].get("created_at") or 0), reverse=True)
+    return result
+
+
+def _clear_automation_runtime_context(chat_key: str) -> None:
+    """Очищает только незавершённые действия Hybrid AI, не трогая другие плагины."""
+    with LOCK:
+        PENDING_PRODUCT_CLARIFY.pop(chat_key, None)
+        queue = CHAT_QUEUES.get(chat_key)
+        if queue is not None:
+            queue.clear()
+
+
+def _set_automation_order_lock(
+    chat_id: Any,
+    order_id: Any,
+    lot_id: Any,
+    *,
+    source: str,
+    force: bool = False,
+) -> bool:
+    """Ставит AI-lock для конкретного заказа отмеченного владельцем лота."""
+    chat_key = str(chat_id or "")
+    lid = str(lot_id or "")
+    if not chat_key or not lid:
+        return False
+    policy = _automation_lot_policy(lid)
+    if not force and not policy.get("enabled"):
+        return False
+    key = _automation_order_key(order_id, chat_key, lid)
+    now = time.time()
+    created = False
+    with LOCK:
+        records = _automation_lock_records()
+        old = records.get(key) if isinstance(records.get(key), dict) else {}
+        created = not bool(old.get("active"))
+        records[key] = {
+            "order_id": str(order_id or "").strip().lstrip("#").upper(),
+            "chat_id": chat_key,
+            "lot_id": lid,
+            "active": True,
+            "release": str(policy.get("release") or old.get("release") or "order_closed"),
+            "created_at": float(old.get("created_at") or now),
+            "updated_at": now,
+            "source": str(source or "sale_event"),
+            "manual_override": False,
+            "release_reason": "",
+            "released_at": 0.0,
+        }
+        # Авторитетный order event разрешает pending race-guard этого же заказа.
+        oid = str(order_id or "").strip().lstrip("#").upper()
+        if oid:
+            AUTOMATION_PENDING_SALES.pop(oid, None)
+    _clear_automation_runtime_context(chat_key)
+    save_config()
+    if created:
+        RUNTIME_STATS["automation_locks_created"] = int(RUNTIME_STATS.get("automation_locks_created", 0)) + 1
+        logger.info(f"{LOG_PREFIX} chat={chat_key} order={key} lot={lid} hybrid_ai_lock=enabled source={source}")
+    return True
+
+
+def _release_automation_order_lock(
+    key_or_order_id: Any,
+    *,
+    reason: str,
+    manual_override: bool = False,
+) -> bool:
+    key = str(key_or_order_id or "").strip().lstrip("#").upper()
+    changed = False
+    with LOCK:
+        records = _automation_lock_records()
+        raw = records.get(key)
+        if not isinstance(raw, dict) or not raw.get("active"):
+            return False
+        raw["active"] = False
+        raw["released_at"] = time.time()
+        raw["updated_at"] = raw["released_at"]
+        raw["release_reason"] = str(reason or "released")
+        raw["manual_override"] = bool(manual_override)
+        changed = True
+    if changed:
+        _prune_automation_lock_records()
+        save_config()
+        logger.info(f"{LOG_PREFIX} order={key} hybrid_ai_lock=released reason={reason}")
+    return changed
+
+
+def _release_automation_chat_locks(chat_id: Any, *, reason: str = "manual", manual_override: bool = True) -> int:
+    chat_key = str(chat_id or "")
+    keys = [key for key, _ in _automation_active_records(chat_id=chat_key)]
+    count = 0
+    for key in keys:
+        count += 1 if _release_automation_order_lock(key, reason=reason, manual_override=manual_override) else 0
+    return count
+
+
+def _automation_pending_for_chat(chat_id: Any) -> list[dict[str, Any]]:
+    chat_key = str(chat_id or "")
+    with LOCK:
+        return [copy.deepcopy(v) for v in AUTOMATION_PENDING_SALES.values() if str(v.get("chat_id") or "") == chat_key]
+
+
+def _automation_chat_block_reason(chat_id: Any) -> str:
+    active = _automation_active_records(chat_id=chat_id)
+    if active:
+        lots = sorted({str(rec.get("lot_id") or "?") for _, rec in active})
+        return "automation_order_active:" + ",".join(lots[:4])
+    if _automation_pending_for_chat(chat_id):
+        return "automation_order_resolving"
+    return ""
+
+
+def _block_automation_chat_if_needed(c: "Cardinal", m: Any, count_stat: bool = True) -> bool:
+    chat_key = str(getattr(m, "chat_id", "") or "")
+    # После рестарта persisted lock может уже быть закрыт, пока плагин был офлайн.
+    # Перед первым решением в этом чате один раз перечитываем историю: системное
+    # ORDER_CONFIRMED/REFUND снимет stale lock до того, как мы отбросим новое сообщение.
+    with LOCK:
+        need_reconcile = bool(chat_key and chat_key not in CHAT_ROLE_BOOTSTRAPPED and _automation_active_records(chat_id=chat_key))
+    if need_reconcile:
+        try:
+            _refresh_chat_role_state(c, m, force=True)
+        except Exception:
+            logger.debug(f"{LOG_PREFIX} Не удалось reconcile automation lock после рестарта chat={chat_key}.", exc_info=True)
+    reason = _automation_chat_block_reason(chat_key)
+    if not reason:
+        return False
+    _clear_automation_runtime_context(chat_key)
+    if count_stat:
+        RUNTIME_STATS["automation_blocks"] = int(RUNTIME_STATS.get("automation_blocks", 0)) + 1
+        RUNTIME_STATS["last_decision"] = f"automation AI-lock: {reason}"
+    logger.info(f"{LOG_PREFIX} chat={chat_key} autoreply_skipped={reason}")
+    return True
+
+
+def _start_pending_automation_sale(c: "Cardinal", item: Any, role: str | None, order_id: str) -> None:
+    """Race-guard до NewOrderEvent. Не создаёт постоянный lock без точного lot_id."""
+    if role != "seller" or not order_id or not _automation_any_marked_lots():
+        return
+    chat_key = str(getattr(item, "chat_id", "") or "")
+    if not chat_key:
+        return
+    # Если прямо перед покупкой уже был точно выбран вручную отмеченный лот,
+    # блокируем его немедленно; NewOrderEvent позже подтвердит lot_id.
+    with LOCK:
+        lid = str(CHAT_LOT.get(chat_key) or "")
+        seen_at = float(CHAT_LOT_AT.get(chat_key) or 0)
+    if lid and _automation_lot_enabled(lid) and time.time() - seen_at <= 1800:
+        _set_automation_order_lock(chat_key, order_id, lid, source="system_purchase_context")
+        return
+    with LOCK:
+        AUTOMATION_PENDING_SALES[order_id] = {
+            "order_id": order_id,
+            "chat_id": chat_key,
+            "created_at": time.time(),
+        }
+    _clear_automation_runtime_context(chat_key)
+    logger.info(f"{LOG_PREFIX} chat={chat_key} order={order_id} automation_sale_resolution=pending")
+
+
+def _resolve_pending_automation_sale(order_id: Any, chat_id: Any) -> None:
+    oid = str(order_id or "").strip().lstrip("#").upper()
+    chat_key = str(chat_id or "")
+    with LOCK:
+        if oid:
+            AUTOMATION_PENDING_SALES.pop(oid, None)
+        else:
+            for key, rec in list(AUTOMATION_PENDING_SALES.items()):
+                if str(rec.get("chat_id") or "") == chat_key:
+                    AUTOMATION_PENDING_SALES.pop(key, None)
+
+
+def _reconcile_automation_transaction_message(item: Any, type_name: str, role: str | None) -> bool:
+    """Закрывает/reopen уже известные locks; историю не использует для создания новых."""
+    order_id = _message_order_id(item)
+    if not order_id:
+        return False
+    key = order_id.upper()
+    with LOCK:
+        raw = _automation_lock_records().get(key)
+        record = copy.deepcopy(raw) if isinstance(raw, dict) else None
+    if not record:
+        return False
+    if role != "seller":
+        return False
+    if type_name in _AUTOMATION_CLOSE_NAMES:
+        _resolve_pending_automation_sale(order_id, getattr(item, "chat_id", ""))
+        if record.get("active") and str(record.get("release") or "order_closed") in {"order_closed", "workflow_done"}:
+            # workflow_done снимается раньше по явному сигналу внешней автовыдачи;
+            # закрытие заказа остаётся безопасным fallback, если сигнал не пришёл.
+            return _release_automation_order_lock(key, reason=type_name.lower(), manual_override=False)
+        return False
+    if type_name == "ORDER_REOPENED":
+        if record.get("manual_override"):
+            return False
+        lid = str(record.get("lot_id") or "")
+        if lid and _automation_lot_enabled(lid):
+            return _set_automation_order_lock(
+                record.get("chat_id") or getattr(item, "chat_id", ""),
+                order_id,
+                lid,
+                source="order_reopened",
+                force=True,
+            )
+    return False
+
+
+def _new_order_lot_id(event: Any) -> str:
+    lot = getattr(event, "lot_shortcut", None)
+    lid = str(getattr(lot, "id", "") or "") if lot is not None else ""
+    if lid:
+        return lid
+    order = getattr(event, "order", None)
+    for obj in (event, order):
+        if obj is None:
+            continue
+        for attr in ("lot_id", "offer_id"):
+            value = getattr(obj, attr, None)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+    # Совместимость со сборками, где NewOrderEvent не несёт lot_shortcut:
+    # описание продажи обычно совпадает с описанием лота. Берём только
+    # уверенное и не неоднозначное совпадение.
+    description = str(getattr(order, "description", "") or "").strip()
+    if description:
+        ranked = find_lot_candidates(description, 2)
+        if ranked:
+            best_lot, best_score = ranked[0]
+            second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+            if best_score >= 0.82 and (best_score - second_score >= 0.08 or second_score < 0.55):
+                return str(best_lot.get("id") or "")
+    return ""
+
+
+def _observe_automation_sale_order(event: Any) -> tuple[bool, str]:
+    order = getattr(event, "order", None)
+    chat_id = getattr(order, "chat_id", "")
+    order_id = str(getattr(order, "id", "") or "").strip().lstrip("#").upper()
+    lid = _new_order_lot_id(event)
+    if not lid:
+        # Если пользователь вообще не отметил автоматизированные лоты, неизвестный
+        # lot_id не должен мешать обычным продажам. Но при наличии ручных меток
+        # держим fail-closed pending до точного разрешения или ручного снятия.
+        if _automation_any_marked_lots() and order_id and str(chat_id or ""):
+            with LOCK:
+                AUTOMATION_PENDING_SALES[order_id] = {
+                    "order_id": order_id,
+                    "chat_id": str(chat_id),
+                    "created_at": time.time(),
+                    "source": "new_order_lot_unknown",
+                }
+            _clear_automation_runtime_context(str(chat_id))
+            logger.warning(f"{LOG_PREFIX} order={order_id} lot_id неизвестен; Hybrid AI остаётся fail-closed до разрешения заказа.")
+            return False, "lot_unknown_pending"
+        _resolve_pending_automation_sale(order_id, chat_id)
+        return False, "lot_unknown_no_marked_lots"
+    _resolve_pending_automation_sale(order_id, chat_id)
+    if not _automation_lot_enabled(lid):
+        return False, "lot_not_marked"
+    return _set_automation_order_lock(chat_id, order_id, lid, source="new_order_event"), "locked"
+
+
+# Public hooks: другой плагин автовыдачи при желании может явно сообщить об
+# окончании/старте своего workflow. Они не нужны для базовой работы v2.5.4,
+# но позволяют снять AI-lock сразу после успешной автоматизации, не дожидаясь
+# подтверждения заказа покупателем.
+def set_automation_ai_lock(chat_id: Any, order_id: Any, lot_id: Any, source: str = "external_automation") -> bool:
+    return _set_automation_order_lock(chat_id, order_id, lot_id, source=source, force=False)
+
+
+def release_automation_ai_lock(order_id: Any = "", chat_id: Any = "", reason: str = "external_automation_done") -> int:
+    """Сигнал успешного завершения внешней автовыдачи.
+
+    Снимает только locks с политикой ``workflow_done``. Режим ``manual``
+    принципиально остаётся под контролем владельца, а ``order_closed`` ждёт
+    системного закрытия/подтверждения заказа.
+    """
+    oid = str(order_id or "").strip().lstrip("#").upper()
+    if oid:
+        with LOCK:
+            raw = _automation_lock_records().get(oid)
+            release = str(raw.get("release") or "order_closed") if isinstance(raw, dict) else ""
+        if release != "workflow_done":
+            return 0
+        return 1 if _release_automation_order_lock(oid, reason=reason, manual_override=False) else 0
+    if chat_id:
+        count = 0
+        for key, rec in _automation_active_records(chat_id=chat_id):
+            if str(rec.get("release") or "order_closed") != "workflow_done":
+                continue
+            count += 1 if _release_automation_order_lock(key, reason=reason, manual_override=False) else 0
+        return count
+    return 0
+
+
+# ============================================================================
+# Seller-only role guard
+# ============================================================================
+_ROLE_ORDER_ID_RE = re.compile(r"#([A-Z0-9]{8})\b", re.I)
+_ROLE_BUYER_PREFIX_RE = re.compile(r"(?:Покупатель|The\s+buyer)\s+([^\s,.]+)", re.I)
+_ROLE_SELLER_PREFIX_RE = re.compile(r"(?:Продавец|The\s+seller)\s+([^\s,.]+)", re.I)
+_ROLE_REFUND_BUYER_RE = re.compile(r"(?:покупателю|the\s+buyer)\s+([^\s,.]+)", re.I)
+_ROLE_SELLER_EVENT_NAMES = {
+    "ORDER_PURCHASED", "ORDER_CONFIRMED", "NEW_FEEDBACK", "FEEDBACK_CHANGED", "FEEDBACK_DELETED",
+    "NEW_FEEDBACK_ANSWER", "FEEDBACK_ANSWER_CHANGED", "FEEDBACK_ANSWER_DELETED", "REFUND",
+    "REFUND_BY_ADMIN", "PARTIAL_REFUND", "ORDER_CONFIRMED_BY_ADMIN", "ORDER_REOPENED",
+}
+_ROLE_BUYER_INITIATED_NAMES = {
+    "ORDER_PURCHASED", "ORDER_CONFIRMED", "NEW_FEEDBACK", "FEEDBACK_CHANGED", "FEEDBACK_DELETED",
+}
+_ROLE_SELLER_INITIATED_NAMES = {
+    "NEW_FEEDBACK_ANSWER", "FEEDBACK_ANSWER_CHANGED", "FEEDBACK_ANSWER_DELETED", "REFUND",
+}
+_ROLE_CLOSE_BUYER_NAMES = {"ORDER_CONFIRMED", "ORDER_CONFIRMED_BY_ADMIN", "REFUND", "REFUND_BY_ADMIN"}
+
+
+def _message_type_name(item: Any) -> str:
+    value = getattr(item, "type", item)
+    name = getattr(value, "name", None)
+    if name:
+        return str(name).upper()
+    raw = str(value or "")
+    if "." in raw:
+        raw = raw.rsplit(".", 1)[-1]
+    raw = re.sub(r"[^A-Z0-9_]+", "_", raw.upper()).strip("_")
+    # Совместимость со старыми/тестовыми enum-объектами: сначала сравниваем
+    # напрямую с известными атрибутами MessageTypes.
+    for candidate in _ROLE_SELLER_EVENT_NAMES | {"NON_SYSTEM"}:
+        enum_value = getattr(MessageTypes, candidate, None)
+        try:
+            if enum_value is not None and value == enum_value:
+                return candidate
+        except Exception:
+            pass
+    return raw
+
+
+def _message_order_id(item: Any) -> str:
+    text = str(getattr(item, "text", "") or "")
+    match = _ROLE_ORDER_ID_RE.search(text)
+    return match.group(1).upper() if match else ""
+
+
+def _same_identity(a: Any, b: Any) -> bool:
+    aa = str(a or "").strip().casefold().lstrip("@").rstrip(".,")
+    bb = str(b or "").strip().casefold().lstrip("@").rstrip(".,")
+    return bool(aa and bb and aa == bb)
+
+
+def _transaction_role_from_text(c: "Cardinal", item: Any, type_name: str) -> str | None:
+    """Fallback для старых FunPayAPI без i_am_buyer/i_am_seller."""
+    account = getattr(c, "account", None)
+    account_id = getattr(account, "id", None)
+    initiator_id = getattr(item, "initiator_id", None)
+    if initiator_id is not None and account_id is not None:
+        try:
+            if type_name in _ROLE_BUYER_INITIATED_NAMES:
+                return "buyer" if int(initiator_id) == int(account_id) else "seller"
+            if type_name in _ROLE_SELLER_INITIATED_NAMES:
+                return "seller" if int(initiator_id) == int(account_id) else "buyer"
+        except Exception:
+            pass
+
+    text = str(getattr(item, "text", "") or "")
+    username = getattr(account, "username", None)
+    if not text or not username:
+        return None
+
+    buyer_match = _ROLE_BUYER_PREFIX_RE.search(text)
+    seller_match = _ROLE_SELLER_PREFIX_RE.search(text)
+    if type_name in _ROLE_BUYER_INITIATED_NAMES and buyer_match:
+        return "buyer" if _same_identity(buyer_match.group(1), username) else "seller"
+    if type_name in _ROLE_SELLER_INITIATED_NAMES and seller_match:
+        return "seller" if _same_identity(seller_match.group(1), username) else "buyer"
+    if type_name == "REFUND_BY_ADMIN":
+        buyer_match = _ROLE_REFUND_BUYER_RE.search(text)
+        if buyer_match:
+            return "buyer" if _same_identity(buyer_match.group(1), username) else "seller"
+    if type_name == "ORDER_CONFIRMED_BY_ADMIN":
+        # В системном тексте после слов об отправке денег указан продавец.
+        seller_tail = re.search(r"(?:продавцу|seller)\s+([^\s,.]+)", text, re.I)
+        if seller_tail:
+            return "seller" if _same_identity(seller_tail.group(1), username) else "buyer"
+    return None
+
+
+def _transaction_role(c: "Cardinal", item: Any, type_name: str) -> str | None:
+    if getattr(item, "i_am_buyer", None) is True:
+        return "buyer"
+    if getattr(item, "i_am_seller", None) is True:
+        return "seller"
+    return _transaction_role_from_text(c, item, type_name)
+
+
+def _new_chat_role_state() -> dict[str, Any]:
+    return {
+        "latest_role": "unknown",
+        "active_buyer_orders": set(),
+        "buyer_active_unknown": False,
+        "order_roles": {},
+        "checked_at": 0.0,
+        "check_failed": False,
+        "reason": "unknown",
+    }
+
+
+def _apply_transaction_role_message(c: "Cardinal", state: dict[str, Any], item: Any) -> bool:
+    type_name = _message_type_name(item)
+    if type_name not in _ROLE_SELLER_EVENT_NAMES:
+        return False
+    order_id = _message_order_id(item)
+    order_roles = state.setdefault("order_roles", {})
+    role = _transaction_role(c, item, type_name)
+    if role is None and order_id:
+        role = order_roles.get(order_id)
+    if role in {"buyer", "seller"}:
+        state["latest_role"] = role
+        if order_id:
+            order_roles[order_id] = role
+
+    active: set[str] = state.setdefault("active_buyer_orders", set())
+    if type_name == "ORDER_PURCHASED" and role == "buyer":
+        if order_id:
+            active.add(order_id)
+        else:
+            state["buyer_active_unknown"] = True
+        state["reason"] = "buyer_order_active"
+    elif type_name in _ROLE_CLOSE_BUYER_NAMES and role == "buyer":
+        if order_id:
+            active.discard(order_id)
+        else:
+            state["buyer_active_unknown"] = False
+        state["reason"] = "buyer_chat_closed_order"
+    elif type_name == "ORDER_REOPENED":
+        known_role = role or (order_roles.get(order_id) if order_id else None)
+        if known_role == "buyer":
+            if order_id:
+                active.add(order_id)
+            else:
+                state["buyer_active_unknown"] = True
+            state["latest_role"] = "buyer"
+            state["reason"] = "buyer_order_reopened"
+    elif role == "buyer":
+        state["reason"] = "buyer_chat"
+    elif role == "seller":
+        state["reason"] = "seller_chat"
+    state["checked_at"] = time.time()
+    state["check_failed"] = False
+    return True
+
+
+def _role_state_blocks(state: dict[str, Any] | None) -> tuple[bool, str]:
+    state = state or {}
+    active = state.get("active_buyer_orders") or set()
+    if active or state.get("buyer_active_unknown"):
+        return True, "buyer_order_active"
+    if state.get("latest_role") == "buyer":
+        return True, "buyer_chat"
+    return False, ""
+
+
+def _clear_seller_runtime_context(chat_key: str, clear_queue: bool = False) -> None:
+    """Не даёт buyer-чату попасть в seller AI-memory или старый product context."""
+    with LOCK:
+        CHAT_HISTORY.pop(chat_key, None)
+        CHAT_LOT.pop(chat_key, None)
+        CHAT_LOT_AT.pop(chat_key, None)
+        CHAT_LAST_RESOLVED_LOT.pop(chat_key, None)
+        CHAT_LAST_RESOLVED_AT.pop(chat_key, None)
+        PENDING_PRODUCT_CLARIFY.pop(chat_key, None)
+        SELLER_NOTIFY_AT.pop(chat_key, None)
+        if clear_queue:
+            queue = CHAT_QUEUES.get(chat_key)
+            if queue is not None:
+                queue.clear()
+
+
+def _scan_chat_role_messages(c: "Cardinal", chat_key: str, messages: list[Any]) -> dict[str, Any]:
+    state = _new_chat_role_state()
+    for item in messages:
+        type_name = _message_type_name(item)
+        _apply_transaction_role_message(c, state, item)
+        role = _transaction_role(c, item, type_name) if type_name in _ROLE_SELLER_EVENT_NAMES else None
+        _reconcile_automation_transaction_message(item, type_name, role)
+    state["checked_at"] = time.time()
+    with LOCK:
+        CHAT_ROLE_STATE[chat_key] = state
+        CHAT_ROLE_BOOTSTRAPPED.add(chat_key)
+    blocked, _ = _role_state_blocks(state)
+    if blocked:
+        _clear_seller_runtime_context(chat_key, clear_queue=False)
+    return state
+
+
+def _refresh_chat_role_state(
+    c: "Cardinal",
+    m: Any,
+    full_chat: Any | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    chat_key = str(getattr(m, "chat_id", "") or "")
+    if not chat_key:
+        return _new_chat_role_state()
+    with LOCK:
+        if not force and chat_key in CHAT_ROLE_BOOTSTRAPPED:
+            return CHAT_ROLE_STATE.get(chat_key) or _new_chat_role_state()
+    if full_chat is None:
+        get_chat = getattr(getattr(c, "account", None), "get_chat", None)
+        if not callable(get_chat):
+            state = CHAT_ROLE_STATE.get(chat_key) or _new_chat_role_state()
+            state["check_failed"] = True
+            state["checked_at"] = time.time()
+            with LOCK:
+                CHAT_ROLE_STATE[chat_key] = state
+            return state
+        try:
+            full_chat = get_chat(getattr(m, "chat_id", chat_key), with_history=True)
+        except Exception:
+            logger.warning(f"{LOG_PREFIX} Не удалось проверить роль аккаунта в чате {chat_key}; seller-autoreply будет fail-closed при активных покупках.")
+            logger.debug("TRACEBACK", exc_info=True)
+            state = CHAT_ROLE_STATE.get(chat_key) or _new_chat_role_state()
+            state["check_failed"] = True
+            state["checked_at"] = time.time()
+            with LOCK:
+                CHAT_ROLE_STATE[chat_key] = state
+            return state
+    messages = list(getattr(full_chat, "messages", None) or [])
+    return _scan_chat_role_messages(c, chat_key, messages)
+
+
+def _observe_transaction_message(c: "Cardinal", item: Any) -> bool:
+    """Обновляет role-cache сразу на системном событии, закрывая race с queued AI reply."""
+    chat_key = str(getattr(item, "chat_id", "") or "")
+    if not chat_key:
+        return False
+    type_name = _message_type_name(item)
+    if type_name not in _ROLE_SELLER_EVENT_NAMES:
+        return False
+    with LOCK:
+        state = CHAT_ROLE_STATE.get(chat_key)
+        if state is None:
+            state = _new_chat_role_state()
+            CHAT_ROLE_STATE[chat_key] = state
+        changed = _apply_transaction_role_message(c, state, item)
+        CHAT_ROLE_BOOTSTRAPPED.add(chat_key)
+    role = _transaction_role(c, item, type_name)
+    order_id = _message_order_id(item)
+    _reconcile_automation_transaction_message(item, type_name, role)
+    if type_name == "ORDER_PURCHASED":
+        _start_pending_automation_sale(c, item, role, order_id)
+    elif type_name in _AUTOMATION_CLOSE_NAMES:
+        _resolve_pending_automation_sale(order_id, chat_key)
+    blocked, reason = _role_state_blocks(state)
+    if blocked:
+        _clear_seller_runtime_context(chat_key, clear_queue=True)
+        logger.info(f"{LOG_PREFIX} chat={chat_key} seller_autoreply_blocked={reason} source=system_event")
+    return changed
+
+
+def _observe_sales_order(c: "Cardinal", order: Any) -> None:
+    """NewOrderEvent в Cardinal приходит из списка продаж — это сильный seller-side сигнал."""
+    chat_key = str(getattr(order, "chat_id", "") or "")
+    if not chat_key:
+        return
+    order_id = str(getattr(order, "id", "") or "").lstrip("#").upper()
+    with LOCK:
+        state = CHAT_ROLE_STATE.get(chat_key) or _new_chat_role_state()
+        state["latest_role"] = "seller"
+        state["reason"] = "seller_sale_event"
+        state["checked_at"] = time.time()
+        state["check_failed"] = False
+        if order_id:
+            state.setdefault("order_roles", {})[order_id] = "seller"
+        CHAT_ROLE_STATE[chat_key] = state
+        CHAT_ROLE_BOOTSTRAPPED.add(chat_key)
+
+
+def _chat_autoreply_allowed(c: "Cardinal", m: Any, force_refresh: bool = False) -> tuple[bool, str]:
+    """Разрешает plugin reply только если нет достоверного buyer-side контекста.
+
+    Неизвестный pre-order чат остаётся разрешённым, иначе продавец перестал бы
+    отвечать новым потенциальным покупателям. Но если роль не удалось проверить
+    и у аккаунта есть незавершённые покупки, применяется fail-closed.
+    """
+    chat_key = str(getattr(m, "chat_id", "") or "")
+    if not chat_key:
+        return False, "missing_chat_id"
+
+    viewing = getattr(m, "buyer_viewing", None)
+    viewing_is_seller_signal = bool(
+        viewing is not None
+        and (getattr(viewing, "is_viewing_lot", False) or getattr(viewing, "link", None))
+    )
+
+    with LOCK:
+        needs_refresh = force_refresh or chat_key not in CHAT_ROLE_BOOTSTRAPPED
+    state = _refresh_chat_role_state(c, m, force=force_refresh) if needs_refresh else CHAT_ROLE_STATE.get(chat_key)
+
+    # Незавершённая покупка текущего аккаунта имеет абсолютный приоритет и
+    # buyer_viewing её не перебивает. Но после закрытия старой buyer-сделки
+    # реальный «Покупатель смотрит ваш лот» является сильным новым seller-side
+    # сигналом и позволяет корректно сменить направление общения с тем же юзером.
+    active_buyer = bool((state or {}).get("active_buyer_orders") or (state or {}).get("buyer_active_unknown"))
+    if active_buyer:
+        return False, "buyer_order_active"
+    if viewing_is_seller_signal:
+        with LOCK:
+            state = state or _new_chat_role_state()
+            state["latest_role"] = "seller"
+            state["reason"] = "buyer_viewing_seller_signal"
+            state["checked_at"] = time.time()
+            CHAT_ROLE_STATE[chat_key] = state
+            CHAT_ROLE_BOOTSTRAPPED.add(chat_key)
+    blocked, reason = _role_state_blocks(state)
+    if blocked:
+        return False, reason
+
+    if state and state.get("check_failed"):
+        # В финальной pre-send проверке любая ошибка определения роли = запрет.
+        # Так сетевой сбой не может превратить неизвестный buyer-chat в seller reply.
+        if force_refresh:
+            return False, "role_check_failed"
+        active_purchases = getattr(getattr(c, "account", None), "active_purchases", 0)
+        try:
+            active_purchases = int(active_purchases or 0)
+        except Exception:
+            active_purchases = 0
+        if active_purchases > 0:
+            return False, "role_check_failed_with_active_purchases"
+    return True, ""
+
+
+def _block_buyer_chat_if_needed(c: "Cardinal", m: Any, force_refresh: bool = False) -> bool:
+    allowed, reason = _chat_autoreply_allowed(c, m, force_refresh=force_refresh)
+    if allowed:
+        return False
+    chat_key = str(getattr(m, "chat_id", "") or "")
+    _clear_seller_runtime_context(chat_key, clear_queue=False)
+    RUNTIME_STATS["role_blocks"] = int(RUNTIME_STATS.get("role_blocks", 0)) + 1
+    RUNTIME_STATS["last_decision"] = f"seller-only guard: {reason}"
+    logger.info(f"{LOG_PREFIX} chat={chat_key} autoreply_skipped_role={reason}")
+    return True
+
+
 def _history_message_role(c: "Cardinal", item: Any) -> str | None:
     """Определяет роль сообщения из истории FunPay, пропуская системные реплики."""
     msg_type = getattr(item, "type", None)
@@ -2755,9 +3518,11 @@ def _bootstrap_chat_history(c: "Cardinal", m: Any, current_text: str) -> None:
     if not chat_key:
         return
     with LOCK:
-        if chat_key in CHAT_HISTORY_BOOTSTRAPPED:
+        history_ready = chat_key in CHAT_HISTORY_BOOTSTRAPPED
+        role_ready = chat_key in CHAT_ROLE_BOOTSTRAPPED
+        if history_ready and role_ready:
             return
-        # Ставим флаг до сетевого запроса, чтобы два worker-а не грузили один чат одновременно.
+        # Ставим history-флаг до сетевого запроса, чтобы два worker-а не грузили один чат одновременно.
         CHAT_HISTORY_BOOTSTRAPPED.add(chat_key)
 
     get_chat = getattr(getattr(c, "account", None), "get_chat", None)
@@ -2768,6 +3533,17 @@ def _bootstrap_chat_history(c: "Cardinal", m: Any, current_text: str) -> None:
         messages = list(getattr(full_chat, "messages", None) or [])
     except Exception:
         logger.debug(f"{LOG_PREFIX} Не удалось подхватить историю чата {chat_key}.", exc_info=True)
+        return
+
+    # Та же загрузка истории сначала устанавливает роль. Buyer-side чат никогда
+    # не импортируется в seller AI-memory.
+    state = _refresh_chat_role_state(c, m, full_chat=full_chat, force=True)
+    blocked, reason = _role_state_blocks(state)
+    if blocked:
+        _clear_seller_runtime_context(chat_key, clear_queue=False)
+        logger.info(f"{LOG_PREFIX} chat={chat_key} history_bootstrap_skipped_role={reason}")
+        return
+    if history_ready:
         return
     if not messages:
         return
@@ -5414,6 +6190,8 @@ def _process_locked(c: "Cardinal", m: Any, text: str) -> None:
     try:
         with _chat_lock(getattr(m, "chat_id", "")):
             _bootstrap_chat_history(c, m, text)
+            if _block_buyer_chat_if_needed(c, m):
+                return
             add_history(getattr(m, "chat_id", ""), "user", text)
             process_buyer_message(c, m, text)
     except Exception:
@@ -5437,6 +6215,8 @@ def _drain_chat_queue(chat_key: str) -> None:
             # Сначала подхватываем только историю ДО текущего message id, затем
             # добавляем сам текущий вход. Поэтому первый ответ не видит более поздние реплики.
             _bootstrap_chat_history(c, m, text)
+            if _block_buyer_chat_if_needed(c, m):
+                continue
             add_history(getattr(m, "chat_id", ""), "user", text)
             process_buyer_message(c, m, text)
         except Exception:
@@ -5477,6 +6257,14 @@ def _send(c: "Cardinal", m: Any, text: str) -> bool:
     фильтр: при обнаружении секрета исходный текст вообще не отправляется.
     """
     if not text or not is_enabled(c):
+        return False
+    # Первый финальный барьер: отдельная автовыдача владеет диалогом по этому
+    # заказу, поэтому Hybrid AI не отправляет ничего, но другие плагины не затрагиваются.
+    if _block_automation_chat_if_needed(c, m):
+        return False
+    # Последний role-барьер против race: даже если buyer-order появился пока AI уже
+    # генерировал ответ, системное событие обновит role-cache и отправка отменится.
+    if _block_buyer_chat_if_needed(c, m, force_refresh=True):
         return False
     outbound = str(text).strip()
     violation = _outbound_safety_violation(outbound)
@@ -5548,6 +6336,10 @@ def process_buyer_message(
     from_clarification: bool = False,
 ) -> None:
     if not is_enabled(c) or STOP_EVENT.is_set():
+        return
+    if _block_automation_chat_if_needed(c, m):
+        return
+    if _block_buyer_chat_if_needed(c, m):
         return
     delay = max(0.0, min(5.0, float(SETTINGS.get("response_delay", 0.35))))
     if delay and not from_clarification:
@@ -6005,6 +6797,26 @@ def on_new_message(c: "Cardinal", e: "NewMessageEvent") -> None:
         return
     m = e.message
 
+    # Системное событие покупки/подтверждения должно обновить роль ДО любых
+    # фильтров и ДО возможной отправки уже готового AI-ответа. В пачке смотрим
+    # все сообщения, потому что ORDER_PURCHASED и реплика продавца могут прийти рядом.
+    observed_ids: set[str] = set()
+    try:
+        if e.stack:
+            for stacked_event in e.stack.get_stack():
+                stacked_message = getattr(stacked_event, "message", None)
+                if stacked_message is None:
+                    continue
+                marker = str(getattr(stacked_message, "id", "") or id(stacked_message))
+                if marker in observed_ids:
+                    continue
+                observed_ids.add(marker)
+                _observe_transaction_message(c, stacked_message)
+    except Exception:
+        logger.debug(f"{LOG_PREFIX} Не удалось разобрать role-события пачки сообщений.", exc_info=True)
+    if not observed_ids:
+        _observe_transaction_message(c, m)
+
     # Отвечаем только на последнее сообщение пачки.
     try:
         if e.stack and m.id != e.stack.get_stack()[-1].message.id:
@@ -6027,6 +6839,18 @@ def on_new_message(c: "Cardinal", e: "NewMessageEvent") -> None:
         return
     if getattr(m, "chat_name", None) in getattr(c, "blacklist", []):
         RUNTIME_STATS["skipped"] += 1
+        return
+    # Если этот чат сейчас принадлежит отдельному workflow автовыдачи, Hybrid AI
+    # не ставит сообщение даже в очередь. Другие плагины при этом работают обычно.
+    if _block_automation_chat_if_needed(c, m):
+        RUNTIME_STATS["skipped"] += 1
+        return
+    # Если buyer-role уже известна из системного события, не ставим сообщение
+    # даже в очередь. Для неизвестного чата окончательная проверка будет в worker.
+    with LOCK:
+        known_role_state = CHAT_ROLE_STATE.get(str(getattr(m, "chat_id", "") or ""))
+    if _role_state_blocks(known_role_state)[0]:
+        _block_buyer_chat_if_needed(c, m)
         return
     if not _mark_processed(getattr(m, "id", f"{m.chat_id}:{time.time_ns()}")):
         return
@@ -6065,6 +6889,20 @@ def on_last_chat_message_changed(c: "Cardinal", e: Any) -> None:
         RUNTIME_STATS["skipped"] += 1
         return
     if getattr(ch, "last_message_type", None) is not MessageTypes.NON_SYSTEM:
+        # oldMsgGetMode не отдаёт полный Message здесь, поэтому читаем чат и
+        # обновляем buyer/seller role-cache в отдельной короткой задаче.
+        def legacy_role_job() -> None:
+            try:
+                full_chat = c.account.get_chat(ch.id, with_history=True)
+                messages = list(getattr(full_chat, "messages", None) or [])
+                if messages:
+                    _scan_chat_role_messages(c, str(ch.id), messages)
+            except Exception:
+                logger.debug(f"{LOG_PREFIX} oldMsgGetMode: не удалось обновить роль чата {getattr(ch, 'id', '?')}.", exc_info=True)
+        try:
+            EXECUTOR.submit(legacy_role_job)
+        except RuntimeError:
+            pass
         RUNTIME_STATS["skipped"] += 1
         return
     if getattr(ch, "name", None) in getattr(c, "blacklist", []):
@@ -6077,6 +6915,11 @@ def on_last_chat_message_changed(c: "Cardinal", e: Any) -> None:
             if not getattr(full_chat, "messages", None):
                 return
             m = full_chat.messages[-1]
+            _refresh_chat_role_state(c, m, full_chat=full_chat, force=True)
+            if _block_automation_chat_if_needed(c, m):
+                return
+            if _block_buyer_chat_if_needed(c, m):
+                return
             if getattr(m, "author_id", 0) in (0, getattr(c.account, "id", None)):
                 return
             if getattr(m, "by_bot", False) or getattr(m, "by_vertex", False):
@@ -6111,24 +6954,22 @@ def on_last_chat_message_changed(c: "Cardinal", e: Any) -> None:
 
 
 def on_new_order(c: "Cardinal", e: "NewOrderEvent") -> None:
-    """Запоминает товар в контексте чата после нового заказа."""
+    """Запоминает товар, seller-role и включает AI-lock у вручную отмеченных лотов."""
     try:
-        lot = getattr(e, "lot_shortcut", None)
-        if lot is None:
-            lot_id = getattr(e, "lot_id", None)
-            if lot_id is not None:
-                with LOCK:
-                    if str(lot_id) in LOTS:
-                        CHAT_LOT[str(e.order.chat_id)] = str(lot_id)
-                        CHAT_LOT_AT[str(e.order.chat_id)] = time.time()
-                return
-        if lot is not None:
-            lid = str(getattr(lot, "id", ""))
-            if lid:
-                CHAT_LOT[str(e.order.chat_id)] = lid
-                CHAT_LOT_AT[str(e.order.chat_id)] = time.time()
+        order = getattr(e, "order", None)
+        # Сначала automation lock: он должен успеть очистить уже поставленные в
+        # очередь ответы Hybrid AI до любых дальнейших действий по новому заказу.
+        _observe_automation_sale_order(e)
+        _observe_sales_order(c, order)
+        lid = _new_order_lot_id(e)
+        chat_id = str(getattr(order, "chat_id", "") or "")
+        if lid and chat_id:
+            with LOCK:
+                if lid in LOTS:
+                    CHAT_LOT[chat_id] = lid
+                    CHAT_LOT_AT[chat_id] = time.time()
     except Exception:
-        logger.debug(f"{LOG_PREFIX} Не удалось сохранить контекст нового заказа.", exc_info=True)
+        logger.debug(f"{LOG_PREFIX} Не удалось сохранить контекст нового заказа / automation lock.", exc_info=True)
 
 
 # ============================================================================
@@ -6209,7 +7050,8 @@ def init_telegram(cardinal: "Cardinal") -> None:
             f"⚡ Профиль: <b>{utils.escape(performance_label())}</b> · ctx <code>{SETTINGS.get('num_ctx', 2048)}</code>\n"
             f"🎯 Шаблон от: <b>{_pct(SETTINGS['template_threshold'])}</b>\n"
             f"🤖 AI от: <b>{_pct(SETTINGS['ai_threshold'])}</b>\n"
-            f"🛍 Лотов в кэше: <b>{len(LOTS)}</b>\n"
+            f"🛍 Лотов в кэше: <b>{len(LOTS)}</b> · ручных автосценариев: <b>{sum(1 for lid in _automation_lots_cfg() if _automation_lot_enabled(lid))}</b>\n"
+            f"🔒 Активных AI-lock: <b>{len(_automation_active_records()) + len(AUTOMATION_PENDING_SALES)}</b>\n"
             f"🛡 Защита от выдуманных фактов: <b>{utils.bool_to_text(SETTINGS.get('strict_grounding', True))}</b>\n"
             f"🧠 Умный роутер: <b>{utils.bool_to_text(SETTINGS.get('smart_router_enabled', True))}</b> · память <b>{SETTINGS.get('max_history', 12)}</b> сообщений\n"
             f"🧩 Все шаблоны: <b>{utils.bool_to_text(SETTINGS.get('templates_enabled', True))}</b>\n"
@@ -7389,12 +8231,13 @@ def init_telegram(cardinal: "Cardinal") -> None:
         kb = K()
         for lot in lots[start:start + per]:
             source = str(lot.get("auto_delivery_source") or "none")
+            manual_lock = "🔒" if _automation_lot_enabled(lot.get("id")) else ""
             auto = "⚡" if lot.get("auto_delivery") else "👤"
             if source == "text":
                 auto = "📝⚡"
             elif source == "funpay+text":
                 auto = "✅⚡"
-            kb.add(B(f"{auto} #{lot.get('id')} {_short(lot.get('title'), 27)}", callback_data=f"{CBT_PREFIX}:lot:{lot.get('id')}"))
+            kb.add(B(f"{manual_lock}{auto} #{lot.get('id')} {_short(lot.get('title'), 25)}", callback_data=f"{CBT_PREFIX}:lot:{lot.get('id')}"))
         nav = []
         if page > 0:
             nav.append(B("⬅️", callback_data=f"{CBT_PREFIX}:lots:{page-1}"))
@@ -7402,12 +8245,15 @@ def init_telegram(cardinal: "Cardinal") -> None:
             nav.append(B("➡️", callback_data=f"{CBT_PREFIX}:lots:{page+1}"))
         if nav:
             kb.row(*nav)
+        kb.add(B(f"🔒 Активные AI-lock: {len(_automation_active_records()) + len(AUTOMATION_PENDING_SALES)}", callback_data=f"{CBT_PREFIX}:autolocks:0"))
         kb.add(B("🔄 Синхронизировать", callback_data=f"{CBT_PREFIX}:lot:sync"))
         kb.add(B("◀️ Назад", callback_data=f"{CBT_PREFIX}:main"))
         _edit_or_send(
             bot, call,
             f"🛍 <b>Лоты продавца</b> · {len(lots)}\n\n"
-            "⚡ — автовыдача FunPay, 📝⚡ — найдена в тексте, ✅⚡ — подтверждена обоими способами, 👤 — не обнаружена.",
+            "🔒 — лот вручную отмечен как внешний автосценарий: после покупки Hybrid AI замолкает.\n"
+            "⚡ — автовыдача FunPay, 📝⚡ — найдена в тексте, ✅⚡ — подтверждена обоими способами, 👤 — не обнаружена.\n\n"
+            "Ручная метка 🔒 независима от автоопределения FunPay.",
             kb,
         )
 
@@ -7431,7 +8277,22 @@ def init_telegram(cardinal: "Cardinal") -> None:
             return
         note = SETTINGS.get("lot_notes", {}).get(lid, "")
         v = product_vars(lot)
+        policy = _automation_lot_policy(lid)
+        marked = bool(policy.get("enabled"))
+        release = str(policy.get("release") or "order_closed")
+        release_detail = {
+            "order_closed": "после закрытия/подтверждения заказа",
+            "workflow_done": "по сигналу автовыдачи (закрытие заказа — fallback)",
+            "manual": "только вручную",
+        }.get(release, "после закрытия/подтверждения заказа")
         kb = K()
+        kb.add(B(
+            f"🔒 Автосценарий / AI OFF: {'✅' if marked else '❌'}",
+            callback_data=f"{CBT_PREFIX}:lotauto:{lid}:toggle",
+        ))
+        if marked:
+            release_label = {"order_closed": "после закрытия заказа", "workflow_done": "по сигналу автовыдачи", "manual": "только вручную"}.get(release, "после закрытия заказа")
+            kb.add(B(f"🔓 Снять lock: {release_label}", callback_data=f"{CBT_PREFIX}:lotauto:{lid}:release"))
         kb.add(B("✏️ Доп. заметка", callback_data=f"{CBT_PREFIX}:lotnote:{lid}"))
         kb.add(B("◀️ К лотам", callback_data=f"{CBT_PREFIX}:lots:0"))
         desc = str(lot.get("full_description") or lot.get("description") or "")
@@ -7441,14 +8302,114 @@ def init_telegram(cardinal: "Cardinal") -> None:
             f"🛍 <b>#{utils.escape(lid)} {utils.escape(v['product'])}</b>\n\n"
             f"💰 {utils.escape(v['price'])} {utils.escape(v['currency'])}\n"
             f"📦 Количество: {utils.escape(v['amount'])}\n"
-            f"⚡ Автовыдача: <b>{'да' if lot.get('auto_delivery') else 'не обнаружена'}</b>\n"
+            f"⚡ Автовыдача по данным FunPay/текста: <b>{'да' if lot.get('auto_delivery') else 'не обнаружена'}</b>\n"
             f"🔎 Источник: <b>{utils.escape({'funpay': 'функция FunPay', 'text': 'текст лота', 'funpay+text': 'FunPay + текст', 'none': 'нет'}.get(str(lot.get('auto_delivery_source') or 'none'), 'нет'))}</b>\n"
-            f"{auto_match_line}"
+            f"🔒 Ручной автосценарий (Hybrid AI OFF после покупки): <b>{'включён' if marked else 'выключен'}</b>\n"
+            + (f"🔓 Снятие AI-lock: <b>{release_detail}</b>\n" if marked else "")
+            + f"{auto_match_line}"
             f"🎮 {utils.escape(v['subcategory'])}\n\n"
             f"📝 <b>Описание:</b>\n{utils.escape(desc[:1400] or 'нет')}\n\n"
             f"📌 <b>Заметка продавца:</b>\n{utils.escape(note or 'нет')}"
         )
         _edit_or_send(bot, call, text, kb)
+
+    def lot_auto_action(call: CallbackQuery) -> None:
+        parts = call.data.split(":")
+        if len(parts) < 4:
+            bot.answer_callback_query(call.id, "Некорректная команда", show_alert=True)
+            return
+        lid = str(parts[-2])
+        action = str(parts[-1])
+        if lid not in LOTS:
+            bot.answer_callback_query(call.id, "Лот не найден", show_alert=True)
+            return
+        current = _automation_lot_policy(lid)
+        if action == "toggle":
+            enabled = not bool(current.get("enabled"))
+            with LOCK:
+                cfg = SETTINGS.setdefault("automation_lots", {})
+                if enabled:
+                    cfg[lid] = {"enabled": True, "release": str(current.get("release") or "order_closed")}
+                else:
+                    cfg.pop(lid, None)
+            save_config()
+            if enabled:
+                bot.answer_callback_query(call.id, "🔒 Лот отмечен: после покупки Hybrid AI будет отключён")
+            else:
+                bot.answer_callback_query(call.id, "✅ Метка снята. Уже активные locks не снимаются автоматически.")
+        elif action == "release":
+            if not current.get("enabled"):
+                bot.answer_callback_query(call.id, "Сначала включите ручной автосценарий", show_alert=True)
+                return
+            release_cycle = {"order_closed": "workflow_done", "workflow_done": "manual", "manual": "order_closed"}
+            new_release = release_cycle.get(str(current.get("release")), "order_closed")
+            with LOCK:
+                SETTINGS.setdefault("automation_lots", {})[lid] = {"enabled": True, "release": new_release}
+                # Изменение политики в карточке лота применяется и к уже активным
+                # заказам этого лота, чтобы UI не показывал одно, а runtime делал другое.
+                for rec in _automation_lock_records().values():
+                    if isinstance(rec, dict) and rec.get("active") and str(rec.get("lot_id") or "") == lid:
+                        rec["release"] = new_release
+                        rec["updated_at"] = time.time()
+            save_config()
+            bot.answer_callback_query(call.id, "✅ Режим снятия AI-lock изменён для новых и активных заказов")
+        # Перерисовываем карточку через тот же обработчик без рекурсивного callback-answer.
+        fake = copy.copy(call)
+        fake.data = f"{CBT_PREFIX}:lot:{lid}"
+        lot_action(fake)
+
+    def automation_locks_page(call: CallbackQuery) -> None:
+        try:
+            page = int(call.data.split(":")[-1])
+        except Exception:
+            page = 0
+        active = _automation_active_records()
+        with LOCK:
+            pending = [(str(k), copy.deepcopy(v)) for k, v in AUTOMATION_PENDING_SALES.items()]
+        combined: list[tuple[str, str, dict[str, Any]]] = [
+            ("active", key, rec) for key, rec in active
+        ] + [("pending", key, rec) for key, rec in pending]
+        combined.sort(key=lambda item: float(item[2].get("created_at") or 0), reverse=True)
+        per = 5
+        start = page * per
+        kb = K()
+        lines = [f"🔒 <b>Активные AI-lock / ожидания</b> · {len(combined)}", ""]
+        if not combined:
+            lines.append("Сейчас Hybrid AI не заблокирован ни одним автоматизированным заказом.")
+        for kind, key, rec in combined[start:start + per]:
+            oid = str(rec.get("order_id") or key)
+            if kind == "pending":
+                lines.append(f"• ⏳ <code>#{utils.escape(oid)}</code> · ожидается точный lot_id; Hybrid AI временно fail-closed")
+                kb.add(B(f"🔓 Снять ожидание #{_short(oid, 10)}", callback_data=f"{CBT_PREFIX}:autounlock:{key}"))
+                continue
+            lid = str(rec.get("lot_id") or "?")
+            title = _short((LOTS.get(lid) or {}).get("title") or f"лот #{lid}", 34)
+            release = {"order_closed": "до закрытия", "workflow_done": "до сигнала автовыдачи", "manual": "вручную"}.get(str(rec.get("release")), "до закрытия")
+            lines.append(f"• <code>#{utils.escape(oid)}</code> · лот <code>#{utils.escape(lid)}</code> · {utils.escape(title)} · {utils.escape(release)}")
+            kb.add(B(f"🔓 Снять #{_short(oid, 10)} · лот #{lid}", callback_data=f"{CBT_PREFIX}:autounlock:{key}"))
+        nav = []
+        if page > 0:
+            nav.append(B("⬅️", callback_data=f"{CBT_PREFIX}:autolocks:{page-1}"))
+        if start + per < len(combined):
+            nav.append(B("➡️", callback_data=f"{CBT_PREFIX}:autolocks:{page+1}"))
+        if nav:
+            kb.row(*nav)
+        kb.add(B("◀️ К лотам", callback_data=f"{CBT_PREFIX}:lots:0"))
+        lines.append("")
+        lines.append("Этот lock относится только к Hybrid AI. Отдельный плагин автовыдачи продолжает отправлять свои сообщения.")
+        _edit_or_send(bot, call, "\n".join(lines), kb)
+
+    def automation_unlock_action(call: CallbackQuery) -> None:
+        key = str(call.data.split(":")[-1]).upper()
+        ok = _release_automation_order_lock(key, reason="owner_manual_unlock", manual_override=True)
+        pending_removed = False
+        if not ok:
+            with LOCK:
+                pending_removed = AUTOMATION_PENDING_SALES.pop(key, None) is not None
+        bot.answer_callback_query(call.id, "✅ AI-lock снят вручную" if (ok or pending_removed) else "Lock уже не активен")
+        fake = copy.copy(call)
+        fake.data = f"{CBT_PREFIX}:autolocks:0"
+        automation_locks_page(fake)
 
     def lot_note_action(call: CallbackQuery) -> None:
         lid = call.data.split(":")[-1]
@@ -7496,6 +8457,9 @@ def init_telegram(cardinal: "Cardinal") -> None:
             f"👤 Вызовов продавца: <b>{RUNTIME_STATS['seller_calls']}</b>\n"
             f"🤔 Неуверенных ответов: <b>{RUNTIME_STATS['uncertain_answers']}</b>\n"
             f"🔒 Privacy/policy блокировок: <b>{RUNTIME_STATS['privacy_blocks']}</b>\n"
+            f"🛡️ Buyer-role блокировок: <b>{RUNTIME_STATS.get('role_blocks', 0)}</b>\n"
+            f"🔒 Automation AI-lock блокировок: <b>{RUNTIME_STATS.get('automation_blocks', 0)}</b>\n"
+            f"⚙️ Automation locks создано: <b>{RUNTIME_STATS.get('automation_locks_created', 0)}</b>\n"
             f"🧭 Последнее решение: <code>{utils.escape(RUNTIME_STATS['last_decision'])}</code>"
         )
         _edit_or_send(bot, call, text, kb)
@@ -7503,7 +8467,7 @@ def init_telegram(cardinal: "Cardinal") -> None:
     def help_page(call: CallbackQuery) -> None:
         kb = K().add(B("◀️ Назад", callback_data=f"{CBT_PREFIX}:main"))
         text = (
-            "📖 <b>Как работает Hybrid AI AutoReply v2.4</b>\n\n"
+            "📖 <b>Как работает Hybrid AI AutoReply v2.5.4</b>\n\n"
             "1️⃣ Сообщения одного чата ставятся в отдельную FIFO-очередь и обрабатываются строго по порядку. "
             "Более поздняя реплика не попадает в контекст первого ответа.\n"
             "2️⃣ В <b>🧠 AI-логика / Промпт</b> есть главный переключатель <b>🧩 Все шаблоны</b>. "
@@ -7529,7 +8493,12 @@ def init_telegram(cardinal: "Cardinal") -> None:
             "1️⃣2️⃣ Если AI недоступна, в гибридном режиме остаются шаблоны; в AI-only плагин сохраняет только "
             "строгий выбор лота, уточнения и безопасные fallback-ответы, не подменяя нейросеть шаблонным ответом.\n"
             "1️⃣3️⃣ Раздел <b>🔄 Обновления</b> проверяет manifest, SHA-256, UUID, VERSION и синтаксис, "
-            "сохраняет предыдущий .py как .bak и не заменяет пользовательский JSON-конфиг.\n\n"
+            "сохраняет предыдущий .py как .bak и не заменяет пользовательский JSON-конфиг.\n"
+            "1️⃣4️⃣ Seller-only guard проверяет системные события сделки и роль аккаунта. Если этот аккаунт покупает "
+            "у другого продавца, автоответы блокируются; прямо перед отправкой роль проверяется повторно и при ошибке сообщение не уходит.\n"
+            "1️⃣5️⃣ В карточке каждого лота можно вручную включить <b>🔒 Автосценарий / AI OFF</b>. После покупки такого лота "
+            "Hybrid AI не отвечает в этом чате, пока заказ не закрыт/подтверждён либо пока владелец вручную не снимет lock — "
+            "в зависимости от режима. Отдельные плагины автовыдачи этим lock не блокируются.\n\n"
             "🌐 <b>Ollama на другом ПК</b>\n"
             "Можно использовать адрес вида <code>http://192.168.1.50:11434</code>. "
             "Не публикуйте Ollama напрямую в интернет без VPN/защищённого прокси."
@@ -7565,6 +8534,9 @@ def init_telegram(cardinal: "Cardinal") -> None:
     tg.cbq_handler(rules_page, lambda c: c.data.startswith(f"{CBT_PREFIX}:rules:"))
     tg.cbq_handler(rule_action, lambda c: c.data.startswith(f"{CBT_PREFIX}:rule:"))
     tg.cbq_handler(lots_page, lambda c: c.data.startswith(f"{CBT_PREFIX}:lots:"))
+    tg.cbq_handler(lot_auto_action, lambda c: c.data.startswith(f"{CBT_PREFIX}:lotauto:"))
+    tg.cbq_handler(automation_locks_page, lambda c: c.data.startswith(f"{CBT_PREFIX}:autolocks:"))
+    tg.cbq_handler(automation_unlock_action, lambda c: c.data.startswith(f"{CBT_PREFIX}:autounlock:"))
     tg.cbq_handler(lot_action, lambda c: c.data.startswith(f"{CBT_PREFIX}:lot:") and not c.data.startswith(f"{CBT_PREFIX}:lotnote:"))
     tg.cbq_handler(lot_note_action, lambda c: c.data.startswith(f"{CBT_PREFIX}:lotnote:"))
     tg.cbq_handler(stats, lambda c: c.data == f"{CBT_PREFIX}:stats")

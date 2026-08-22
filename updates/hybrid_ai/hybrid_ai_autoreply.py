@@ -52,9 +52,9 @@ if TYPE_CHECKING:
 # Метаданные плагина
 # ============================================================================
 NAME = "Hybrid AI AutoReply 🤖 | @revengezza"
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 DESCRIPTION = (
-    "Умный AI-заместитель продавца FunPay v2.4: понимает смысл запросов независимо от формулировки, "
+    "Умный AI-заместитель продавца FunPay v2.4.1: понимает смысл запросов независимо от формулировки, "
     "отличает обычное общение от вопросов о товаре, покупке, заказе и продавце, а факты берёт только "
     "из подтверждённых данных. Конфиденциальные данные и личные контакты отсекаются до AI и ещё раз "
     "проверяются перед отправкой покупателю; запросы против правил FunPay получают безопасный отказ. "
@@ -374,7 +374,7 @@ def _migrate_system_rules(rules: list[Any]) -> list[dict[str, Any]]:
 
 
 DEFAULTS: dict[str, Any] = {
-    "version": 18,
+    "version": 19,
     "enabled": True,
     "setup_done": False,
     "ollama_enabled": True,
@@ -448,7 +448,8 @@ DEFAULTS: dict[str, Any] = {
     "unknown_reply": "В доступной информации нет точного ответа на этот вопрос. Уточните, пожалуйста, что именно нужно узнать.",
     "product_clarify_reply": (
         "Какой именно товар / лот вы имеете в виду? "
-        "Напишите название и отличающий вариант — например срок, количество, регион или платформу."
+        "Напишите название и отличающий вариант — например срок, количество, регион или платформу. "
+        "Чтобы отменить выбор товара, напишите !отмена."
     ),
     "rules": _default_rules(),
     "lot_notes": {},
@@ -673,6 +674,16 @@ def load_config() -> None:
         # Защитные фильтры обязательны и не зависят от пользовательского промпта.
         # v2.4 privacy/policy guard обязательный и не имеет выключателя в конфиге.
         SETTINGS["version"] = 18
+    if cfg_version < 19:
+        # v2.4.1: явная команда !отмена для сброса выбора товара. Обновляем только
+        # штатный текст v2.4, не перезаписывая пользовательский вариант подсказки.
+        old_default = (
+            "Какой именно товар / лот вы имеете в виду? "
+            "Напишите название и отличающий вариант — например срок, количество, регион или платформу."
+        )
+        if str(SETTINGS.get("product_clarify_reply") or "") == old_default:
+            SETTINGS["product_clarify_reply"] = DEFAULTS["product_clarify_reply"]
+        SETTINGS["version"] = 19
     save_config()
 
 
@@ -1746,6 +1757,57 @@ def _pending_product_clear(chat_id: Any) -> None:
         PENDING_PRODUCT_CLARIFY.pop(str(chat_id or ""), None)
 
 
+_PRODUCT_SELECTION_CANCEL_ALIASES = {
+    "отмена", "отменить", "отмени", "cancel",
+    "отменить выбор", "отмени выбор", "сбросить выбор", "сбрось выбор",
+    "отменить выбор товара", "отмени выбор товара", "сбросить выбор товара", "сбрось выбор товара",
+    "неважно", "не важно", "забудь", "другой вопрос",
+}
+
+
+def _last_message_line(text: str) -> str:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    return lines[-1] if lines else str(text or "").strip()
+
+
+def _is_explicit_product_cancel_command(text: str) -> bool:
+    # Явная команда работает даже без активного pending. Сохраняем ! или / до
+    # normalize_text, чтобы обычное слово «неважно» вне выбора не перехватывалось.
+    line = _last_message_line(text).lower().replace("ё", "е")
+    line = re.sub(r"\s+", " ", line).strip()
+    return bool(re.fullmatch(r"[!/]\s*(?:отмена|отменить|cancel)", line, flags=re.I))
+
+
+def _is_product_selection_cancel(text: str) -> bool:
+    # В активном сценарии выбора сохраняем и естественные варианты «отмена»,
+    # «неважно», «другой вопрос». Cardinal может объединить пачку сообщений.
+    normalized = normalize_text(_last_message_line(text))
+    return normalized in _PRODUCT_SELECTION_CANCEL_ALIASES
+
+
+def _clear_product_selection_context(chat_id: Any) -> bool:
+    """Полностью сбрасывает выбор/память товара для одного чата.
+
+    Команда !отмена должна быть сильнее обычного авто-сброса pending: после неё
+    фразы «этот лот» не должны внезапно возвращать ранее выбранный товар.
+    """
+    key = str(chat_id or "")
+    if not key:
+        return False
+    with LOCK:
+        had_context = any((
+            key in PENDING_PRODUCT_CLARIFY,
+            key in CHAT_LAST_RESOLVED_LOT,
+            key in CHAT_LOT,
+        ))
+        PENDING_PRODUCT_CLARIFY.pop(key, None)
+        CHAT_LAST_RESOLVED_LOT.pop(key, None)
+        CHAT_LAST_RESOLVED_AT.pop(key, None)
+        CHAT_LOT.pop(key, None)
+        CHAT_LOT_AT.pop(key, None)
+    return had_context
+
+
 def _clear_pending_for_independent_message(m: Any, reason: str) -> None:
     """Сбрасывает устаревшее ожидание выбора товара перед новым самостоятельным сообщением.
 
@@ -1780,7 +1842,7 @@ def _looks_like_product_selection_reply(text: str) -> bool:
     if _number_choice(text) is not None:
         return True
     n = normalize_text(text)
-    if n in {"отмена", "отменить", "неважно", "не важно", "забудь", "другой вопрос"}:
+    if _is_product_selection_cancel(text):
         return False
     signal, _ranked = _catalog_reference_signal(text)
     return signal
@@ -4065,6 +4127,16 @@ def _handle_smart_router(
         return True
 
     if action == "clarify_product":
+        if is_seller_lot_count_question(buyer_text):
+            # Этот вопрос относится ко всему каталогу продавца. Даже если маленькая
+            # модель ошибочно увидела слово «товар» и попросила product-context,
+            # не возвращаем покупателя в цикл выбора конкретного лота.
+            reply = seller_lot_count_reply(c)
+            if _send(c, m, reply):
+                RUNTIME_STATS["router_answers"] += 1
+                RUNTIME_STATS["seller_lot_stats"] += 1
+                RUNTIME_STATS["last_decision"] = "AI-router clarify_product исправлен: количество лотов продавца"
+            return True
         if product_scope and lot is not None:
             # Код уже выбрал точный лот; повторное уточнение — ошибка модели.
             RUNTIME_STATS["last_decision"] = "AI-router ошибочно запросил уже выбранный товар — fallback"
@@ -4089,6 +4161,13 @@ def _handle_smart_router(
 
     if action == "answer":
         if decision.get("needs_product") and lot is None:
+            if is_seller_lot_count_question(buyer_text):
+                reply = seller_lot_count_reply(c)
+                if _send(c, m, reply):
+                    RUNTIME_STATS["router_answers"] += 1
+                    RUNTIME_STATS["seller_lot_stats"] += 1
+                    RUNTIME_STATS["last_decision"] = "AI-router needs_product исправлен: количество лотов продавца"
+                return True
             return resolve_and_reroute("AI-router по смыслу определил, что ответ требует товар")
 
         answer = str(decision.get("answer") or "").strip()
@@ -4474,7 +4553,7 @@ def _ask_product_candidates(c: "Cardinal", m: Any, ranked: list[tuple[dict[str, 
             title_raw = str(lot.get("title") or lot.get("description") or "").strip()
             title = _sanitize_confidential_context(title_raw) or f"вариант {i}"
             lines.append(f"{i}) {title}")
-        lines.append("Напишите номер варианта (например, 1) или название товара чуть точнее.")
+        lines.append("Напишите номер варианта (например, 1) или название товара чуть точнее. Для отмены: !отмена.")
         with LOCK:
             pending = PENDING_PRODUCT_CLARIFY.get(str(getattr(m, "chat_id", "") or ""))
             if pending is not None:
@@ -4486,7 +4565,7 @@ def _ask_product_candidates(c: "Cardinal", m: Any, ranked: list[tuple[dict[str, 
             c,
             m,
             "Не смог найти такой товар среди лотов. Напишите название точнее — "
-            "например категорию, срок, количество, регион или платформу.",
+            "например категорию, срок, количество, регион или платформу. Для отмены: !отмена.",
         )
         with LOCK:
             pending = PENDING_PRODUCT_CLARIFY.get(str(getattr(m, "chat_id", "") or ""))
@@ -4516,6 +4595,21 @@ def process_buyer_message(
     chat_key = str(getattr(m, "chat_id", "") or "")
     templates_on = bool(SETTINGS.get("templates_enabled", True))
 
+    # Явная !отмена обрабатывается до privacy/router/product-логики и работает
+    # даже без активного pending. Естественные «отмена/неважно» перехватываем
+    # только когда плагин действительно ждёт выбор товара.
+    pending_before_cancel = _pending_product_get(chat_key) is not None
+    if _is_explicit_product_cancel_command(buyer_text) or (
+        pending_before_cancel and _is_product_selection_cancel(buyer_text)
+    ):
+        had_context = _clear_product_selection_context(chat_key)
+        logger.info(
+            f"{LOG_PREFIX} chat={chat_key} product_selection_cancelled=true had_context={str(had_context).lower()}"
+        )
+        if _send(c, m, "Хорошо, выбор товара отменён. Можете задать другой вопрос."):
+            RUNTIME_STATS["last_decision"] = "выбор товара отменён командой"
+        return
+
     def configured_basic_reply(system_key: str, fallback: str) -> str | None:
         # Владелец может отредактировать или выключить любой базовый шаблон.
         configured = _system_rule(system_key, enabled_only=False)
@@ -4536,12 +4630,13 @@ def process_buyer_message(
             RUNTIME_STATS["last_decision"] = f"локальный policy/privacy отказ: {restricted_code}"
         return
 
+    seller_lot_count_intent = is_seller_lot_count_question(buyer_text)
     business_intent = (
         is_quantity_purchase_question(buyer_text)
         or is_purchase_permission_question(buyer_text)
         or looks_product_dependent(buyer_text)
         or looks_seller_profile_question(buyer_text)
-        or is_seller_lot_count_question(buyer_text)
+        or seller_lot_count_intent
         or is_seller_trust_question(buyer_text)
         or is_seller_summon_question(buyer_text)
     )
@@ -4600,13 +4695,7 @@ def process_buyer_message(
                 logger.debug(f"{LOG_PREFIX} Не удалось обновить лоты перед уточнением.", exc_info=True)
 
         normalized = normalize_text(buyer_text)
-        if normalized in {"отмена", "отменить", "неважно", "не важно", "забудь", "другой вопрос"}:
-            _pending_product_clear(chat_key)
-            logger.info(f"{LOG_PREFIX} chat={chat_key} pending_product_cleared=cancelled")
-            if _send(c, m, "Хорошо, выбор товара отменён."):
-                RUNTIME_STATS["last_decision"] = "выбор товара отменён"
-            return
-        elif normalized in {"ок", "окей", "понял", "понятно", "хорошо", "ладно"}:
+        if normalized in {"ок", "окей", "понял", "понятно", "хорошо", "ладно"}:
             # Подтверждение не является названием лота. Оставляем выбор активным,
             # но не спамим повторным списком.
             RUNTIME_STATS["skipped"] += 1
@@ -4639,7 +4728,7 @@ def process_buyer_message(
                 or is_purchase_permission_question(buyer_text)
                 or is_presence_question(buyer_text)
                 or looks_seller_profile_question(buyer_text)
-                or is_seller_lot_count_question(buyer_text)
+                or seller_lot_count_intent
                 or is_seller_trust_question(buyer_text)
                 or is_seller_summon_question(buyer_text)
                 or looks_like_question(buyer_text)
@@ -4668,7 +4757,7 @@ def process_buyer_message(
                     return
 
     # 3) Безопасные структурированные вопросы о продавце не требуют AI.
-    if templates_on and is_seller_lot_count_question(buyer_text):
+    if templates_on and seller_lot_count_intent:
         _clear_pending_for_independent_message(m, "seller_lot_count")
         reply = seller_lot_count_reply(c)
         if _send(c, m, reply):
@@ -4695,7 +4784,7 @@ def process_buyer_message(
 
     # В AI-only режиме вопрос о количестве лотов тоже должен получить проверяемые данные,
     # но сам ответ формулирует нейросеть.
-    if not templates_on and is_seller_lot_count_question(buyer_text):
+    if not templates_on and seller_lot_count_intent:
         with LOCK:
             no_cached_lots = not bool(LOTS)
         if no_cached_lots:
@@ -4718,10 +4807,13 @@ def process_buyer_message(
     effective_rule = rule if rule and rscore >= 0.55 else None
     requires_product = bool(effective_rule and effective_rule.get("requires_product"))
     product_text_signal = (
-        requires_product
-        or looks_product_dependent(buyer_text)
-        or _is_context_product_reference(buyer_text)
-        or _has_explicit_product_reference(buyer_text)
+        not seller_lot_count_intent
+        and (
+            requires_product
+            or looks_product_dependent(buyer_text)
+            or _is_context_product_reference(buyer_text)
+            or _has_explicit_product_reference(buyer_text)
+        )
     )
 
     if product_text_signal and not LOTS:
@@ -4733,8 +4825,17 @@ def process_buyer_message(
     catalog_signal, catalog_ranked = _catalog_reference_signal(buyer_text)
     strong_catalog_match = bool(catalog_ranked and _product_match_is_confident(buyer_text, catalog_ranked))
     context_product_reference = _is_context_product_reference(buyer_text)
-    product_intent = requires_product or looks_product_dependent(buyer_text) or context_product_reference
+    product_intent = (
+        not seller_lot_count_intent
+        and (requires_product or looks_product_dependent(buyer_text) or context_product_reference)
+    )
     product_scope = forced_lot is not None or product_intent or catalog_signal
+
+    # «Сколько товаров/лотов у продавца?» — вопрос о каталоге продавца целиком,
+    # а не о свойствах одного товара. Особенно важно в AI-only: слова «товаров»
+    # не должны снова включать product_scope после очистки pending_product.
+    if forced_lot is None and seller_lot_count_intent:
+        product_scope = False
 
     # Справочный вопрос вроде «что такое Telegram?» не становится товарным только
     # потому, что слово Telegram встречается в названиях нескольких лотов. Полное

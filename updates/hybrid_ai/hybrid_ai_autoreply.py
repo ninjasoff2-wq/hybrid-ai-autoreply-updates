@@ -3119,13 +3119,30 @@ def _external_api_chat_unlocked(
     if not _resolve_api_key():
         raise RuntimeError("API key не задан или переменная окружения пуста.")
 
+    requested_max_tokens = max(16, min(4096, int(max_tokens)))
+    preset = str(SETTINGS.get("api_preset") or "").strip().lower()
+    is_groq_gpt_oss = (
+        preset == "groq"
+        and model in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}
+    )
     base_payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "temperature": max(0.0, min(2.0, float(temperature))),
-        "max_tokens": max(16, min(4096, int(max_tokens))),
+        "max_tokens": requested_max_tokens,
         "stream": False,
     }
+    if is_groq_gpt_oss:
+        # GPT-OSS on Groq spends completion tokens on a separate reasoning
+        # channel before producing message.content. A tiny max_tokens budget
+        # (the UI test used 16) can therefore end with finish_reason=length
+        # and an empty content. Use Groq's current completion-token parameter,
+        # keep reasoning effort low for an auto-reply bot, and give the model
+        # enough room to reach the final answer.
+        base_payload.pop("max_tokens", None)
+        base_payload["max_completion_tokens"] = max(1024, requested_max_tokens)
+        base_payload["reasoning_effort"] = "low"
+        base_payload["include_reasoning"] = False
     timeout = max(30, min(600, int(SETTINGS.get("ollama_timeout", 120))))
     last_error: Exception | None = None
     # response_format=json_object поддерживается не всеми OpenAI-compatible API.

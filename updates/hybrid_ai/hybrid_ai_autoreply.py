@@ -37,7 +37,7 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import requests
 from telebot.types import CallbackQuery, InlineKeyboardButton as B, InlineKeyboardMarkup as K, Message
@@ -56,9 +56,9 @@ if TYPE_CHECKING:
 # Метаданные плагина
 # ============================================================================
 NAME = "Hybrid AI AutoReply 🤖 | @revengezza"
-VERSION = "2.6.1"
+VERSION = "2.6.2"
 DESCRIPTION = (
-    "Умный AI-заместитель продавца FunPay v2.6.1: поддерживает локальную/удалённую Ollama, облачные "
+    "Умный AI-заместитель продавца FunPay v2.6.2: поддерживает локальную/удалённую Ollama, облачные "
     "OpenAI-совместимые API и отдельную вкладку бесплатных API-моделей без локальной нейросети; в гибридном режиме сначала использует подходящие шаблоны, "
     "а если шаблон не подошёл — продолжает той же безопасной AI-логикой, что и AI-only. "
     "Не путает бытовой small-talk с лотами даже при fuzzy-совпадениях в описаниях, помнит безопасную хронологию "
@@ -86,6 +86,7 @@ STATE_MODEL = f"{CBT_PREFIX}_model"
 STATE_API_URL = f"{CBT_PREFIX}_api_url"
 STATE_API_KEY = f"{CBT_PREFIX}_api_key"
 STATE_API_MODEL = f"{CBT_PREFIX}_api_model"
+STATE_API_PROXY = f"{CBT_PREFIX}_api_proxy"
 STATE_SELLER_INFO = f"{CBT_PREFIX}_seller_info"
 STATE_SELLER_PROFILE_URL = f"{CBT_PREFIX}_seller_profile_url"
 STATE_FACTS = f"{CBT_PREFIX}_facts"
@@ -446,7 +447,7 @@ def _migrate_system_rules(rules: list[Any]) -> list[dict[str, Any]]:
 
 
 DEFAULTS: dict[str, Any] = {
-    "version": 23,
+    "version": 24,
     "enabled": True,
     "setup_done": False,
     # Сохраняем историческое имя ollama_enabled ради обратной совместимости:
@@ -461,6 +462,10 @@ DEFAULTS: dict[str, Any] = {
     # Можно сохранить ключ напрямую или строку env:VARIABLE_NAME.
     "api_key": "",
     "api_model": "",
+    # Прокси только для облачных AI API. auto = использовать Cardinal, если он настроен;
+    # cardinal = явно использовать прокси Cardinal; manual = отдельный прокси плагина.
+    "api_proxy_mode": "auto",  # auto / cardinal / manual
+    "api_proxy": "",
     "ollama_timeout": 120,
     "strict_grounding": True,
     "disable_thinking": True,
@@ -561,6 +566,7 @@ CHAT_LAST_RESOLVED_AT: dict[str, float] = {}
 # Ожидаемое уточнение товара: chat_id -> исходный вопрос, время и варианты-кандидаты.
 PENDING_PRODUCT_CLARIFY: dict[str, dict[str, Any]] = {}
 SELLER_NOTIFY_AT: dict[str, float] = {}
+API_PROXY_NOTIFY_AT: float = 0.0
 CHAT_LOCKS: dict[str, threading.Lock] = {}
 CHAT_QUEUES: dict[str, deque[tuple["Cardinal", Any, str]]] = {}
 CHAT_QUEUE_ACTIVE: set[str] = set()
@@ -824,6 +830,12 @@ def load_config() -> None:
         SETTINGS.setdefault("api_key", "")
         SETTINGS.setdefault("api_model", "")
         SETTINGS["version"] = 23
+    if cfg_version < 24:
+        # v2.6.2: отдельный прокси облачных AI API и интерактивная помощь при 403/451.
+        # По умолчанию сохраняется прежнее поведение: наследуем Cardinal, если он настроен.
+        SETTINGS.setdefault("api_proxy_mode", "auto")
+        SETTINGS.setdefault("api_proxy", "")
+        SETTINGS["version"] = 24
     save_config()
 
 
@@ -2725,12 +2737,287 @@ def _api_headers() -> dict[str, str]:
     return headers
 
 
+_SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks4", "socks5", "socks5h"}
+
+
+def _proxy_host_port(host: str, port: Any) -> tuple[str, int]:
+    host = str(host or "").strip()
+    if not host or any(ch.isspace() for ch in host) or any(ch in host for ch in "/@?#"):
+        raise ValueError("Некорректный адрес прокси.")
+    try:
+        port_int = int(port)
+    except Exception as e:
+        raise ValueError("Порт прокси должен быть числом.") from e
+    if not 1 <= port_int <= 65535:
+        raise ValueError("Порт прокси должен быть от 1 до 65535.")
+    if ":" in host:
+        try:
+            ipaddress.ip_address(host)
+        except ValueError as e:
+            raise ValueError("IPv6 прокси указывайте в квадратных скобках: [IPv6]:PORT.") from e
+    return host, port_int
+
+
+def _build_proxy_url(scheme: str, host: str, port: Any, username: str = "", password: str = "") -> str:
+    scheme = str(scheme or "http").strip().lower()
+    if scheme == "socks":
+        scheme = "socks5"
+    if scheme not in _SUPPORTED_PROXY_SCHEMES:
+        allowed = ", ".join(sorted(_SUPPORTED_PROXY_SCHEMES))
+        raise ValueError(f"Неподдерживаемый тип прокси: {scheme}. Поддерживаются: {allowed}.")
+    host, port_int = _proxy_host_port(host, port)
+    host_part = f"[{host}]" if ":" in host else host
+    username = str(username or "")
+    password = str(password or "")
+    if password and not username:
+        raise ValueError("Для пароля прокси нужен логин.")
+    auth = ""
+    if username:
+        auth = quote(unquote(username), safe="")
+        if password:
+            auth += ":" + quote(unquote(password), safe="")
+        auth += "@"
+    return f"{scheme}://{auth}{host_part}:{port_int}"
+
+
+def _normalize_proxy_input(value: Any) -> str:
+    """Принимает распространённые форматы прокси и приводит их к URL для requests.
+
+    Поддерживаются:
+      host:port
+      host:port:login:password
+      login:password@host:port
+      login:password:host:port
+      http(s)://[login:password@]host:port
+      socks4/socks5/socks5h://[login:password@]host:port
+      [IPv6]:port и URL-варианты IPv6.
+    """
+    raw = str(value or "").strip()
+    if raw.lower().startswith("proxy="):
+        raw = raw.split("=", 1)[1].strip()
+    if not raw:
+        raise ValueError("Прокси не указан.")
+    if len(raw) > 1000 or any(ch in raw for ch in "\r\n\t"):
+        raise ValueError("Некорректная строка прокси.")
+
+    if "://" in raw:
+        parsed = urlparse(raw)
+        scheme = parsed.scheme.lower()
+        if scheme == "socks":
+            scheme = "socks5"
+        if parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment:
+            raise ValueError("В адресе прокси не должно быть пути, query или fragment.")
+        try:
+            port = parsed.port
+        except ValueError as e:
+            raise ValueError("Некорректный порт прокси.") from e
+        if not parsed.hostname or port is None:
+            raise ValueError("Укажите прокси как host:port или scheme://host:port.")
+        return _build_proxy_url(
+            scheme,
+            parsed.hostname,
+            port,
+            unquote(parsed.username or ""),
+            unquote(parsed.password or ""),
+        )
+
+    # [IPv6]:port или [IPv6]:port:login:password
+    if raw.startswith("["):
+        m = re.fullmatch(r"\[([^\]]+)\]:(\d+)(?::([^:]+):(.+))?", raw)
+        if not m:
+            raise ValueError("IPv6 прокси: [IPv6]:PORT или [IPv6]:PORT:LOGIN:PASSWORD.")
+        return _build_proxy_url("http", m.group(1), m.group(2), m.group(3) or "", m.group(4) or "")
+
+    parts = raw.split(":")
+    if len(parts) == 2:
+        return _build_proxy_url("http", parts[0], parts[1])
+
+    def _strong_host(value: str) -> bool:
+        value = str(value or "").strip().lower()
+        if value == "localhost" or "." in value:
+            return True
+        try:
+            ipaddress.ip_address(value)
+            return True
+        except ValueError:
+            return False
+
+    # LOGIN:PASSWORD:HOST:PORT бывает двусмысленным, если PASSWORD — число.
+    # Если HOST явно похож на IP/FQDN, а первый сегмент — нет, предпочитаем эту форму.
+    if len(parts) >= 4 and parts[-1].isdigit() and _strong_host(parts[-2]) and not _strong_host(parts[0]):
+        return _build_proxy_url("http", parts[-2], parts[-1], parts[0], ":".join(parts[1:-2]))
+
+    # Наиболее распространённый у прокси-продавцов формат: IP:PORT:LOGIN:PASSWORD.
+    # Проверяем его ДО login:password@host:port, чтобы '@' внутри пароля не ломал разбор.
+    if len(parts) >= 4 and parts[1].isdigit():
+        return _build_proxy_url("http", parts[0], parts[1], parts[2], ":".join(parts[3:]))
+
+    # login:password@host:port
+    if "@" in raw:
+        auth, endpoint = raw.rsplit("@", 1)
+        if ":" not in auth:
+            raise ValueError("Авторизацию укажите как login:password@host:port.")
+        username, password = auth.split(":", 1)
+        endpoint_url = _normalize_proxy_input(endpoint)
+        parsed = urlparse(endpoint_url)
+        return _build_proxy_url("http", parsed.hostname or "", parsed.port, username, password)
+
+    # Также встречается LOGIN:PASSWORD:HOST:PORT. Пароль может содержать ':'.
+    if len(parts) >= 4 and parts[-1].isdigit():
+        return _build_proxy_url("http", parts[-2], parts[-1], parts[0], ":".join(parts[1:-2]))
+
+    raise ValueError(
+        "Не удалось распознать прокси. Используйте IP:PORT:LOGIN:PASSWORD, "
+        "LOGIN:PASSWORD@IP:PORT или URL вида http://login:password@IP:PORT."
+    )
+
+
+def _mask_proxy_value(value: Any) -> str:
+    try:
+        normalized = _normalize_proxy_input(value)
+        parsed = urlparse(normalized)
+        host = parsed.hostname or "?"
+        host_part = f"[{host}]" if ":" in host else host
+        auth = ""
+        if parsed.username:
+            auth = f"{unquote(parsed.username)}:***@" if parsed.password is not None else f"{unquote(parsed.username)}@"
+        return f"{parsed.scheme}://{auth}{host_part}:{parsed.port}"
+    except Exception:
+        return "настроен (скрыт)" if str(value or "").strip() else "не задан"
+
+
+def _cardinal_proxy_mapping() -> dict[str, str]:
+    cardinal = _CARDINAL
+    proxy = getattr(cardinal, "proxy", None) if cardinal is not None else None
+    if isinstance(proxy, dict):
+        clean = {
+            str(k): str(v)
+            for k, v in proxy.items()
+            if str(k or "").strip() and str(v or "").strip()
+        }
+        return clean
+    if isinstance(proxy, str) and proxy.strip():
+        try:
+            normalized = _normalize_proxy_input(proxy)
+            return {"http": normalized, "https": normalized}
+        except ValueError:
+            return {}
+    return {}
+
+
+def _api_proxy_status_text() -> str:
+    mode = str(SETTINGS.get("api_proxy_mode") or "auto").lower()
+    if mode == "manual":
+        value = str(SETTINGS.get("api_proxy") or "").strip()
+        return f"ручной · {_mask_proxy_value(value)}" if value else "ручной · не задан"
+    cardinal_proxy = _cardinal_proxy_mapping()
+    if mode == "cardinal":
+        return "Cardinal · найден" if cardinal_proxy else "Cardinal · не найден"
+    return "авто · Cardinal найден" if cardinal_proxy else "авто · без прокси Cardinal"
+
+
+def _api_proxy_kwargs() -> dict[str, Any]:
+    """Возвращает requests-compatible proxy mapping только для облачных AI API."""
+    mode = str(SETTINGS.get("api_proxy_mode") or "auto").lower()
+    if mode == "manual":
+        raw = str(SETTINGS.get("api_proxy") or "").strip()
+        if not raw:
+            return {}
+        try:
+            normalized = _normalize_proxy_input(raw)
+        except ValueError as e:
+            logger.warning(f"{LOG_PREFIX} Ручной API-прокси повреждён: {e}")
+            return {}
+        return {"proxies": {"http": normalized, "https": normalized}}
+    if mode in {"auto", "cardinal"}:
+        proxy = _cardinal_proxy_mapping()
+        if proxy:
+            return {"proxies": proxy}
+    return {}
+
+
 def _sanitize_api_error(text: Any) -> str:
     value = str(text or "")
     key = _resolve_api_key()
     if key:
         value = value.replace(key, "[API_KEY]")
+    manual_proxy = str(SETTINGS.get("api_proxy") or "").strip()
+    if manual_proxy:
+        value = value.replace(manual_proxy, "[PROXY]")
+        try:
+            normalized = _normalize_proxy_input(manual_proxy)
+            value = value.replace(normalized, "[PROXY]")
+        except ValueError:
+            pass
+    for proxy_url in _cardinal_proxy_mapping().values():
+        if proxy_url:
+            value = value.replace(proxy_url, "[PROXY]")
     return _replace_sensitive_values(value)[:1000]
+
+
+def _is_api_region_or_access_error(error: Any) -> bool:
+    """Консервативно распознаёт ошибки, где прокси действительно может помочь."""
+    text = str(error or "").lower()
+    strong_region_markers = (
+        "unsupported_country", "unsupported country", "country is not supported",
+        "region is not supported", "unsupported region", "not available in your country",
+        "not available in this country", "geo blocked", "geoblocked", "geo-blocked",
+        "country/region", "country or region",
+    )
+    if any(marker in text for marker in strong_region_markers):
+        return True
+    if re.search(r"(?:http\s*)?451\b", text):
+        return True
+    if not re.search(r"(?:http\s*)?403\b", text):
+        return False
+    # 403 сам по себе не доказывает геоблок: это может быть Model Permissions.
+    # Но это именно тот класс access-ошибок, при котором полезно предложить
+    # сменить исходящий IP, не утверждая, что причина точно в регионе.
+    return True
+
+
+def _api_proxy_choice_kb() -> K:
+    kb = K(row_width=2)
+    kb.row(
+        B("🌐 Взять из Cardinal", callback_data=f"{CBT_PREFIX}:proxy:cardinal"),
+        B("✏️ Ввести вручную", callback_data=f"{CBT_PREFIX}:proxy:manual"),
+    )
+    kb.add(B("☁️ Настройки API", callback_data=f"{CBT_PREFIX}:api"))
+    return kb
+
+
+def _api_region_error_text(error: Any) -> str:
+    safe = _sanitize_api_error(error)
+    return (
+        "❌ <b>API отклонил запрос</b>\n\n"
+        f"<code>{utils.escape(safe)}</code>\n\n"
+        "⚠️ Ошибка доступа/региона (часто HTTP 403/451) может быть связана с ограничением страны, исходящего IP, "
+        "Cloudflare или правами доступа у самого провайдера. Это не доказывает региональную блокировку, "
+        "но прокси часто помогает, если сервис недоступен с текущего IP.\n\n"
+        "Выберите источник прокси:"
+    )
+
+
+def notify_api_region_proxy_error(c: "Cardinal", error: Any) -> bool:
+    """Один раз за несколько минут уведомляет владельца о вероятной access/region ошибке API."""
+    global API_PROXY_NOTIFY_AT
+    if ai_provider() == "ollama" or not _is_api_region_or_access_error(error) or not getattr(c, "telegram", None):
+        return False
+    now = time.time()
+    with LOCK:
+        if now - API_PROXY_NOTIFY_AT < 300:
+            return False
+        API_PROXY_NOTIFY_AT = now
+
+    def _job() -> None:
+        try:
+            c.telegram.send_notification(_api_region_error_text(error), keyboard=_api_proxy_choice_kb())
+        except Exception:
+            logger.warning(f"{LOG_PREFIX} Не удалось отправить уведомление о возможной региональной ошибке API.")
+            logger.debug("TRACEBACK", exc_info=True)
+
+    threading.Thread(target=_job, daemon=True, name="HybridAI-api-proxy-hint").start()
+    return True
 
 
 def api_models() -> list[str]:
@@ -2744,7 +3031,12 @@ def api_models() -> list[str]:
         raise RuntimeError("API key не задан или переменная окружения пуста.")
     timeout = max(10, min(120, int(SETTINGS.get("ollama_timeout", 120))))
     try:
-        r = requests.get(url, headers=_api_headers(), timeout=(8, min(timeout, 30)))
+        r = requests.get(
+            url,
+            headers=_api_headers(),
+            timeout=(8, min(timeout, 30)),
+            **_api_proxy_kwargs(),
+        )
         r.raise_for_status()
         data = r.json()
     except requests.RequestException as e:
@@ -2844,14 +3136,26 @@ def _external_api_chat_unlocked(
         if structured:
             payload["response_format"] = {"type": "json_object"}
         try:
-            r = requests.post(url, headers=_api_headers(), json=payload, timeout=(10, timeout))
+            r = requests.post(
+                url,
+                headers=_api_headers(),
+                json=payload,
+                timeout=(10, timeout),
+                **_api_proxy_kwargs(),
+            )
             error_body = str(getattr(r, "text", "") or "")
             error_lower = error_body.lower()
             # Новые OpenAI-модели могут требовать max_completion_tokens вместо max_tokens.
             if r.status_code in (400, 422) and "max_tokens" in error_lower and "max_completion_tokens" in error_lower:
                 retry_payload = dict(payload)
                 retry_payload["max_completion_tokens"] = retry_payload.pop("max_tokens", max_tokens)
-                r = requests.post(url, headers=_api_headers(), json=retry_payload, timeout=(10, timeout))
+                r = requests.post(
+                    url,
+                    headers=_api_headers(),
+                    json=retry_payload,
+                    timeout=(10, timeout),
+                    **_api_proxy_kwargs(),
+                )
                 payload = retry_payload
                 error_body = str(getattr(r, "text", "") or "")
                 error_lower = error_body.lower()
@@ -2860,7 +3164,13 @@ def _external_api_chat_unlocked(
             if r.status_code in (400, 422) and "temperature" in error_lower and ("unsupported" in error_lower or "not support" in error_lower):
                 retry_payload = dict(payload)
                 retry_payload.pop("temperature", None)
-                r = requests.post(url, headers=_api_headers(), json=retry_payload, timeout=(10, timeout))
+                r = requests.post(
+                    url,
+                    headers=_api_headers(),
+                    json=retry_payload,
+                    timeout=(10, timeout),
+                    **_api_proxy_kwargs(),
+                )
                 payload = retry_payload
             if structured and r.status_code in (400, 404, 422):
                 last_error = RuntimeError(f"response_format не поддержан: HTTP {r.status_code}")
@@ -7465,6 +7775,8 @@ def process_buyer_message(
             return
     except Exception as e:
         logger.warning(f"{LOG_PREFIX} AI-router недоступен, используется локальный fallback: {type(e).__name__}: {e}")
+        if ai_provider() != "ollama":
+            notify_api_region_proxy_error(c, e)
         logger.debug("TRACEBACK", exc_info=True)
         RUNTIME_STATS["errors"] += 1
         RUNTIME_STATS["last_decision"] = "AI-router ошибка — локальный fallback"
@@ -7518,6 +7830,8 @@ def process_buyer_message(
             return
         except Exception as e:
             logger.warning(f"{LOG_PREFIX} AI-провайдер {ai_provider_label()} не ответил: {type(e).__name__}: {_sanitize_api_error(e) if ai_provider() != 'ollama' else e}")
+            if ai_provider() != "ollama":
+                notify_api_region_proxy_error(c, e)
             if not any(x in str(e) for x in ("режим экономии ресурсов", "режим одной генерации")):
                 logger.debug("TRACEBACK", exc_info=True)
                 RUNTIME_STATS["errors"] += 1
@@ -8389,6 +8703,7 @@ def init_telegram(cardinal: "Cardinal") -> None:
             B("📦 Список моделей", callback_data=f"{CBT_PREFIX}:apimodels:0"),
         )
         kb.add(B("🧪 Тестовый запрос", callback_data=f"{CBT_PREFIX}:api:test"))
+        kb.add(B("🌐 Прокси AI API", callback_data=f"{CBT_PREFIX}:proxy"))
         kb.add(B("🆓 Бесплатные API-модели", callback_data=f"{CBT_PREFIX}:freeapi"))
         kb.add(B("◀️ К провайдерам", callback_data=f"{CBT_PREFIX}:provider"))
         return kb
@@ -8463,7 +8778,8 @@ def init_telegram(cardinal: "Cardinal") -> None:
             f"API: <code>{utils.escape(url)}</code>\n"
             f"Ключ: <code>{utils.escape(_mask_api_key())}</code>\n"
             f"Модель: <code>{utils.escape(model)}</code>\n"
-            f"Timeout: <code>{SETTINGS.get('ollama_timeout', 120)}</code> сек.\n\n"
+            f"Timeout: <code>{SETTINGS.get('ollama_timeout', 120)}</code> сек.\n"
+            f"Прокси: <code>{utils.escape(_api_proxy_status_text())}</code>\n\n"
             f"{api_status_lines()}\n\n"
             "Для безопасности ключ в интерфейсе маскируется. Можно ввести сам ключ или "
             "<code>env:OPENROUTER_API_KEY</code> — тогда секрет останется только в переменной окружения.\n\n"
@@ -8471,6 +8787,127 @@ def init_telegram(cardinal: "Cardinal") -> None:
             "отправляются выбранному API-провайдеру."
         )
         _edit_or_send(bot, call, text, api_kb())
+
+    def open_api_proxy(call: CallbackQuery) -> None:
+        kb = K(row_width=2)
+        kb.row(
+            B("🌐 Взять из Cardinal", callback_data=f"{CBT_PREFIX}:proxy:cardinal"),
+            B("✏️ Ввести вручную", callback_data=f"{CBT_PREFIX}:proxy:manual"),
+        )
+        kb.add(B("♻️ Авто (Cardinal если есть)", callback_data=f"{CBT_PREFIX}:proxy:auto"))
+        kb.add(B("🧪 Тестовый запрос", callback_data=f"{CBT_PREFIX}:api:test"))
+        kb.add(B("◀️ К API", callback_data=f"{CBT_PREFIX}:api"))
+        text = (
+            "🌐 <b>Прокси для AI API</b>\n\n"
+            f"Сейчас: <code>{utils.escape(_api_proxy_status_text())}</code>\n\n"
+            "Прокси применяется только к облачным OpenAI-compatible запросам. Ollama не затрагивается.\n\n"
+            "Ручной ввод понимает:\n"
+            "• <code>IP:PORT</code>\n"
+            "• <code>IP:PORT:LOGIN:PASSWORD</code>\n"
+            "• <code>LOGIN:PASSWORD@IP:PORT</code>\n"
+            "• <code>LOGIN:PASSWORD:IP:PORT</code>\n"
+            "• <code>http://LOGIN:PASSWORD@IP:PORT</code> / <code>https://...</code>\n"
+            "• <code>socks4://...</code>, <code>socks5://...</code>, <code>socks5h://...</code>\n"
+            "• IPv6: <code>[IPv6]:PORT</code> или URL-форма.\n\n"
+            "Для SOCKS библиотеке requests нужна поддержка PySocks; если её нет в сборке Cardinal, "
+            "используйте HTTP/HTTPS-прокси."
+        )
+        _edit_or_send(bot, call, text, kb)
+
+    def api_proxy_action(call: CallbackQuery) -> None:
+        action = call.data.split(":")[-1]
+        if action in {"cardinal", "retrycardinal"}:
+            proxy = _cardinal_proxy_mapping()
+            if not proxy:
+                kb = K(row_width=2)
+                kb.row(
+                    B("🔄 Попробовать снова", callback_data=f"{CBT_PREFIX}:proxy:retrycardinal"),
+                    B("✏️ Ввести вручную", callback_data=f"{CBT_PREFIX}:proxy:manual"),
+                )
+                kb.add(B("◀️ К прокси", callback_data=f"{CBT_PREFIX}:proxy"))
+                _edit_or_send(
+                    bot,
+                    call,
+                    "❌ <b>В Cardinal нет прокси</b>\n\n"
+                    "Плагин не нашёл глобальный прокси Cardinal. Если вы только что добавили его в Cardinal, "
+                    "нажмите «Попробовать снова». Иначе введите отдельный прокси для Hybrid AI вручную.",
+                    kb,
+                )
+                return
+            SETTINGS["api_proxy_mode"] = "cardinal"
+            SETTINGS["api_proxy"] = ""
+            save_config()
+            kb = K(row_width=1)
+            kb.add(B("🧪 Повторить тест API", callback_data=f"{CBT_PREFIX}:api:test"))
+            kb.add(B("◀️ К прокси", callback_data=f"{CBT_PREFIX}:proxy"))
+            _edit_or_send(
+                bot,
+                call,
+                "✅ <b>Прокси Cardinal выбран</b>\n\n"
+                "Следующие облачные AI-запросы будут использовать глобальный прокси Cardinal.",
+                kb,
+            )
+            return
+        if action == "manual":
+            msg = admin_send(
+                call.message.chat.id,
+                "Введите прокси. Самый частый формат: <code>IP:PORT:LOGIN:PASSWORD</code>.\n\n"
+                "Также поддерживаются <code>IP:PORT</code>, <code>LOGIN:PASSWORD@IP:PORT</code>, "
+                "<code>LOGIN:PASSWORD:IP:PORT</code>, URL с <code>http://</code>/<code>https://</code> и "
+                "<code>socks4://</code>/<code>socks5://</code>/<code>socks5h://</code>.\n\n"
+                "Сообщение с логином/паролем плагин постарается удалить после сохранения.",
+                reply_markup=CLEAR_STATE_BTN(),
+            )
+            tg.set_state(msg.chat.id, msg.id, call.from_user.id, STATE_API_PROXY)
+            bot.answer_callback_query(call.id)
+            return
+        if action == "auto":
+            SETTINGS["api_proxy_mode"] = "auto"
+            SETTINGS["api_proxy"] = ""
+            save_config()
+            bot.answer_callback_query(call.id, "Автовыбор прокси включён")
+            open_api_proxy(call)
+            return
+        open_api_proxy(call)
+
+    def set_api_proxy(m: Message) -> None:
+        tg.clear_state(m.chat.id, m.from_user.id, True)
+        raw = (m.text or "").strip()
+        try:
+            normalized = _normalize_proxy_input(raw)
+        except ValueError as e:
+            admin_reply(
+                m,
+                f"❌ {utils.escape(str(e))}\n\n"
+                "Пример: <code>185.1.2.3:8080:login:password</code>",
+                reply_markup=K().add(B("✏️ Ввести снова", callback_data=f"{CBT_PREFIX}:proxy:manual")),
+            )
+            return
+        SETTINGS["api_proxy_mode"] = "manual"
+        SETTINGS["api_proxy"] = normalized
+        save_config()
+        try:
+            bot.delete_message(m.chat.id, getattr(m, "message_id", getattr(m, "id", 0)))
+        except Exception:
+            pass
+        warning = ""
+        if urlparse(normalized).scheme.startswith("socks"):
+            try:
+                __import__("socks")
+            except Exception:
+                warning = (
+                    "\n\n⚠️ SOCKS-формат сохранён, но в текущем Python не найден PySocks. "
+                    "Если тест выдаст ошибку о SOCKS dependencies, используйте HTTP/HTTPS-прокси "
+                    "или установите requests[socks]/PySocks в окружение Cardinal."
+                )
+        kb = K(row_width=1)
+        kb.add(B("🧪 Проверить API через прокси", callback_data=f"{CBT_PREFIX}:api:test"))
+        kb.add(B("🌐 Настройки прокси", callback_data=f"{CBT_PREFIX}:proxy"))
+        admin_send(
+            m.chat.id,
+            f"✅ Ручной прокси сохранён: <code>{utils.escape(_mask_proxy_value(normalized))}</code>{warning}",
+            reply_markup=kb,
+        )
 
     def api_presets(call: CallbackQuery) -> None:
         kb = K(row_width=2)
@@ -8543,6 +8980,9 @@ def init_telegram(cardinal: "Cardinal") -> None:
         if action == "status":
             bot.answer_callback_query(call.id, "Проверяю /models…")
             ok, status, models = api_status()
+            if not ok and _is_api_region_or_access_error(status):
+                admin_send(call.message.chat.id, _api_region_error_text(status), reply_markup=_api_proxy_choice_kb())
+                return
             admin_send(
                 call.message.chat.id,
                 ("✅ " if ok else "⚠️ ") + utils.escape(status)
@@ -8561,7 +9001,10 @@ def init_telegram(cardinal: "Cardinal") -> None:
                 )
                 admin_send(call.message.chat.id, f"✅ API ответил: <code>{utils.escape(_short(answer, 120))}</code>")
             except Exception as e:
-                admin_send(call.message.chat.id, f"❌ Тест API не пройден:\n<code>{utils.escape(_sanitize_api_error(e))}</code>")
+                if _is_api_region_or_access_error(e):
+                    admin_send(call.message.chat.id, _api_region_error_text(e), reply_markup=_api_proxy_choice_kb())
+                else:
+                    admin_send(call.message.chat.id, f"❌ Тест API не пройден:\n<code>{utils.escape(_sanitize_api_error(e))}</code>")
             return
 
     def set_api_url(m: Message) -> None:
@@ -8626,8 +9069,11 @@ def init_telegram(cardinal: "Cardinal") -> None:
         try:
             models = api_models()
         except Exception as e:
-            kb = K().add(B("◀️ Назад", callback_data=f"{CBT_PREFIX}:api"))
-            _edit_or_send(bot, call, f"⚠️ <b>Не удалось получить /models</b>\n\n<code>{utils.escape(_sanitize_api_error(e))}</code>", kb)
+            if _is_api_region_or_access_error(e):
+                _edit_or_send(bot, call, _api_region_error_text(e), _api_proxy_choice_kb())
+            else:
+                kb = K().add(B("◀️ Назад", callback_data=f"{CBT_PREFIX}:api"))
+                _edit_or_send(bot, call, f"⚠️ <b>Не удалось получить /models</b>\n\n<code>{utils.escape(_sanitize_api_error(e))}</code>", kb)
             return
         per = 7
         start = page * per
@@ -9581,7 +10027,7 @@ def init_telegram(cardinal: "Cardinal") -> None:
     def help_page(call: CallbackQuery) -> None:
         kb = K().add(B("◀️ Назад", callback_data=f"{CBT_PREFIX}:main"))
         text = (
-            "📖 <b>Как работает Hybrid AI AutoReply v2.6.1</b>\n\n"
+            "📖 <b>Как работает Hybrid AI AutoReply v2.6.2</b>\n\n"
             "1️⃣ Сообщения одного чата ставятся в отдельную FIFO-очередь и обрабатываются строго по порядку. "
             "Более поздняя реплика не попадает в контекст первого ответа.\n"
             "2️⃣ В <b>🧠 AI-логика / Промпт</b> есть главный переключатель <b>🧩 Все шаблоны</b>. "
@@ -9639,6 +10085,8 @@ def init_telegram(cardinal: "Cardinal") -> None:
     tg.cbq_handler(open_free_api, lambda c: c.data == f"{CBT_PREFIX}:freeapi")
     tg.cbq_handler(free_api_action, lambda c: c.data.startswith(f"{CBT_PREFIX}:freeapipick:"))
     tg.cbq_handler(open_api, lambda c: c.data == f"{CBT_PREFIX}:api")
+    tg.cbq_handler(open_api_proxy, lambda c: c.data == f"{CBT_PREFIX}:proxy")
+    tg.cbq_handler(api_proxy_action, lambda c: c.data.startswith(f"{CBT_PREFIX}:proxy:"))
     tg.cbq_handler(api_action, lambda c: c.data.startswith(f"{CBT_PREFIX}:api:"))
     tg.cbq_handler(api_preset_action, lambda c: c.data.startswith(f"{CBT_PREFIX}:apipreset:"))
     tg.cbq_handler(open_api_models, lambda c: c.data.startswith(f"{CBT_PREFIX}:apimodels:"))
@@ -9675,6 +10123,7 @@ def init_telegram(cardinal: "Cardinal") -> None:
     tg.msg_handler(set_api_url, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, STATE_API_URL))
     tg.msg_handler(set_api_key, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, STATE_API_KEY))
     tg.msg_handler(set_api_model, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, STATE_API_MODEL))
+    tg.msg_handler(set_api_proxy, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, STATE_API_PROXY))
     tg.msg_handler(set_assistant_prompt, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, STATE_ASSISTANT_PROMPT))
     tg.msg_handler(set_uncertain_prefix, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, STATE_UNCERTAIN_PREFIX))
     tg.msg_handler(set_uncertain_confidence, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, STATE_UNCERTAIN_CONFIDENCE))
@@ -9705,6 +10154,11 @@ def init_telegram(cardinal: "Cardinal") -> None:
 def post_init(c: "Cardinal") -> None:
     global _CARDINAL
     _CARDINAL = c
+    mode = str(SETTINGS.get("api_proxy_mode") or "auto").lower()
+    if mode == "manual" and str(SETTINGS.get("api_proxy") or "").strip():
+        logger.info(f"{LOG_PREFIX} Облачные AI API используют отдельный ручной прокси Hybrid AI: {_mask_proxy_value(SETTINGS.get('api_proxy'))}.")
+    elif _cardinal_proxy_mapping():
+        logger.info(f"{LOG_PREFIX} Облачные AI API используют глобальный прокси Cardinal.")
     # Если Telegram выключен, PRE_INIT все равно вызвался и загрузил конфиг.
     if not os.path.exists(CFG_PATH):
         load_config()

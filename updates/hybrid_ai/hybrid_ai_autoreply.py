@@ -126,6 +126,35 @@ API_PRESETS: dict[str, tuple[str, str]] = {
     "custom": ("Свой OpenAI-compatible API", ""),
 }
 
+# Безопасные имена env-переменных для готовых пресетов. При смене сервиса
+# прямой ключ предыдущего провайдера нельзя переносить на новый endpoint.
+API_PRESET_ENV_KEYS: dict[str, str] = {
+    "openai": "OPENAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "together": "TOGETHER_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+}
+
+# Together reasoning-модели, для которых официальный API разрешает отключить
+# thinking. Автоответчику на коротких репликах reasoning обычно не нужен.
+TOGETHER_HYBRID_REASONING_MODELS = {
+    "deepseek-ai/deepseek-v4-pro",
+    "zai-org/glm-5.1",
+    "zai-org/glm-5",
+    "moonshotai/kimi-k2.6",
+    "moonshotai/kimi-k2.5",
+    "qwen/qwen3.6-plus",
+    "qwen/qwen3.5-397b-a17b",
+    "qwen/qwen3.5-9b",
+    "deepcogito/cogito-v2-1-671b",
+}
+TOGETHER_REASONING_ONLY_MODELS = {
+    "minimaxai/minimax-m2.7",
+}
+
 # Быстрые бесплатные варианты. Все используют тот же OpenAI-compatible transport,
 # поэтому отдельные SDK не нужны. Лимиты free-tier меняются у провайдеров — текст
 # здесь является подсказкой, а не гарантией доступности/квоты.
@@ -2634,6 +2663,57 @@ def current_free_api_option() -> str:
     return ""
 
 
+def apply_api_preset(key: str) -> tuple[str, str]:
+    """Выбирает готовый API-пресет и не переносит секрет/модель между сервисами."""
+    key = str(key or "").strip().lower()
+    if key not in API_PRESETS:
+        raise KeyError("Неизвестный API preset")
+
+    previous_provider = str(SETTINGS.get("api_preset") or "").strip().lower()
+    provider_changed = previous_provider != key
+    SETTINGS["ai_provider"] = "openai_compatible"
+    SETTINGS["api_preset"] = key
+
+    preset_url = API_PRESETS[key][1]
+    if key != "custom":
+        SETTINGS["api_base_url"] = preset_url
+    elif provider_changed:
+        # Новый custom endpoint должен быть введён явно; не оставляем URL
+        # предыдущего сервиса рядом с новым/пустым ключом.
+        SETTINGS["api_base_url"] = ""
+
+    if provider_changed:
+        SETTINGS["api_model"] = ""
+        env_name = API_PRESET_ENV_KEYS.get(key, "")
+        SETTINGS["api_key"] = f"env:{env_name}" if env_name else ""
+
+    SETTINGS["setup_done"] = True
+    return API_PRESETS[key]
+
+
+def apply_custom_api_url(value: str) -> str:
+    """Сохраняет custom base URL и очищает секрет/модель при смене endpoint."""
+    url = _normalize_openai_base_url(value)
+    allowed, reason = _validate_external_api_base_url(url)
+    if not allowed:
+        raise ValueError(reason)
+
+    previous_url = _normalize_openai_base_url(str(SETTINGS.get("api_base_url") or ""))
+    previous_preset = str(SETTINGS.get("api_preset") or "").strip().lower()
+    endpoint_changed = previous_preset != "custom" or previous_url != url
+
+    SETTINGS["ai_provider"] = "openai_compatible"
+    SETTINGS["api_preset"] = "custom"
+    SETTINGS["api_base_url"] = url
+    if endpoint_changed:
+        # Критично: произвольный новый хост не должен автоматически получить
+        # API key, который раньше использовался с другим сервисом.
+        SETTINGS["api_key"] = ""
+        SETTINGS["api_model"] = ""
+    SETTINGS["setup_done"] = True
+    return url
+
+
 def apply_free_api_option(key: str) -> dict[str, str]:
     """Применяет безопасный OpenAI-compatible free preset без передачи чужого API key."""
     option = FREE_API_OPTIONS.get(str(key or ""))
@@ -3100,6 +3180,101 @@ def ai_selected_model() -> str:
     return str(SETTINGS.get(key) or "").strip()
 
 
+def _apply_external_api_provider_compat(
+    payload: dict[str, Any],
+    *,
+    preset: str,
+    model: str,
+    requested_max_tokens: int,
+) -> dict[str, Any]:
+    """Подстраивает OpenAI-shaped payload под актуальные особенности провайдеров."""
+    preset = str(preset or "").strip().lower()
+    model_lower = str(model or "").strip().lower()
+
+    # OpenAI: max_tokens в Chat Completions устарел; актуальный параметр
+    # max_completion_tokens также учитывает reasoning-токены.
+    if preset == "openai":
+        payload["max_completion_tokens"] = payload.pop("max_tokens", requested_max_tokens)
+        # Старые o-series/GPT-5 reasoning-модели могут потратить маленький лимит
+        # целиком на reasoning и не дойти до видимого content.
+        modern_gpt5 = re.match(r"^gpt-5\.([1-9][0-9]*)(?:\D|$)", model_lower)
+        legacy_reasoning = bool(re.match(r"^o[1-9](?:-|$)", model_lower)) or (
+            model_lower.startswith("gpt-5") and not modern_gpt5
+        )
+        if legacy_reasoning:
+            payload["max_completion_tokens"] = max(2048, requested_max_tokens)
+            payload.pop("temperature", None)
+
+    # Groq GPT-OSS: reasoning идёт отдельным каналом и входит в completion budget.
+    if preset == "groq" and model_lower in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}:
+        payload.pop("max_tokens", None)
+        payload["max_completion_tokens"] = max(1024, requested_max_tokens)
+        payload["reasoning_effort"] = "low"
+        payload["include_reasoning"] = False
+    elif preset == "groq" and "qwen3" in model_lower:
+        # Groq Qwen3 допускает none: для короткого auto-reply это быстрее и
+        # исключает ситуацию, когда весь маленький лимит ушёл на reasoning.
+        payload["reasoning_effort"] = "none"
+
+    # Gemini 2.5 Flash умеет полностью отключать thinking; Gemini 3.x — нет.
+    # Для 3.x используем low и даём запас на обязательные thinking-токены.
+    if preset == "gemini":
+        if model_lower.startswith("gemini-2.5-") and "pro" not in model_lower:
+            payload["reasoning_effort"] = "none"
+        elif model_lower.startswith("gemini-3"):
+            payload.pop("temperature", None)
+            payload["reasoning_effort"] = "low"
+            payload["max_tokens"] = max(2048, requested_max_tokens)
+
+    # openrouter/free может случайно выбрать reasoning-модель (в том числе
+    # GPT-OSS). Не навязываем reasoning-параметр, чтобы не сужать пул роутера,
+    # но даём достаточно общего output budget для финального ответа.
+    if preset == "openrouter" and model_lower == "openrouter/free":
+        payload["max_tokens"] = max(2048, requested_max_tokens)
+
+    if preset == "deepseek" and model_lower in {"deepseek-v4-flash", "deepseek-v4-pro"}:
+        # DeepSeek V4 по умолчанию включает thinking. Для чат-автоответчика
+        # выключаем его явно: ниже latency и content не съедается reasoning.
+        payload["thinking"] = {"type": "disabled"}
+
+    if preset == "together":
+        if model_lower in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}:
+            payload["reasoning_effort"] = "low"
+            payload["max_tokens"] = max(2048, requested_max_tokens)
+        elif model_lower in TOGETHER_HYBRID_REASONING_MODELS:
+            payload["reasoning"] = {"enabled": False}
+        elif model_lower in TOGETHER_REASONING_ONLY_MODELS:
+            payload["max_tokens"] = max(4096, requested_max_tokens)
+
+    return payload
+
+
+def _external_choice_text(data: Any) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    """Извлекает видимый text и служебные поля первого OpenAI-compatible choice."""
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError(f"Некорректный ответ API: {_sanitize_api_error(data)}")
+    first_choice = choices[0] if isinstance(choices[0], dict) else {}
+    message = first_choice.get("message") if isinstance(first_choice, dict) else None
+    message = message if isinstance(message, dict) else {}
+    content = message.get("content") if message else first_choice.get("text")
+    if isinstance(content, list):
+        content = "".join(
+            str(part.get("text") or "") for part in content if isinstance(part, dict)
+        )
+    return str(content or "").strip(), first_choice, message
+
+
+def _empty_completion_needs_more_budget(first_choice: dict[str, Any], message: dict[str, Any]) -> bool:
+    finish_reason = str(first_choice.get("finish_reason") or "").strip().lower()
+    if finish_reason in {"length", "max_tokens"}:
+        return True
+    for key in ("reasoning", "reasoning_content", "reasoning_details"):
+        if message.get(key):
+            return True
+    return False
+
+
 def _external_api_chat_unlocked(
     messages: list[dict[str, str]],
     *,
@@ -3121,10 +3296,6 @@ def _external_api_chat_unlocked(
 
     requested_max_tokens = max(16, min(4096, int(max_tokens)))
     preset = str(SETTINGS.get("api_preset") or "").strip().lower()
-    is_groq_gpt_oss = (
-        preset == "groq"
-        and model in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}
-    )
     base_payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -3132,17 +3303,12 @@ def _external_api_chat_unlocked(
         "max_tokens": requested_max_tokens,
         "stream": False,
     }
-    if is_groq_gpt_oss:
-        # GPT-OSS on Groq spends completion tokens on a separate reasoning
-        # channel before producing message.content. A tiny max_tokens budget
-        # (the UI test used 16) can therefore end with finish_reason=length
-        # and an empty content. Use Groq's current completion-token parameter,
-        # keep reasoning effort low for an auto-reply bot, and give the model
-        # enough room to reach the final answer.
-        base_payload.pop("max_tokens", None)
-        base_payload["max_completion_tokens"] = max(1024, requested_max_tokens)
-        base_payload["reasoning_effort"] = "low"
-        base_payload["include_reasoning"] = False
+    base_payload = _apply_external_api_provider_compat(
+        base_payload,
+        preset=preset,
+        model=model,
+        requested_max_tokens=requested_max_tokens,
+    )
     timeout = max(30, min(600, int(SETTINGS.get("ollama_timeout", 120))))
     last_error: Exception | None = None
     # response_format=json_object поддерживается не всеми OpenAI-compatible API.
@@ -3178,7 +3344,15 @@ def _external_api_chat_unlocked(
                 error_lower = error_body.lower()
             # Некоторые reasoning-модели не принимают temperature. Повторяем без неё
             # только когда сам API явно сообщает об этом параметре.
-            if r.status_code in (400, 422) and "temperature" in error_lower and ("unsupported" in error_lower or "not support" in error_lower):
+            temperature_rejected = (
+                r.status_code in (400, 422)
+                and "temperature" in error_lower
+                and any(marker in error_lower for marker in (
+                    "unsupported", "not support", "unknown", "invalid", "not allowed",
+                    "unrecognized", "not permitted", "only the default", "only default",
+                ))
+            )
+            if temperature_rejected:
                 retry_payload = dict(payload)
                 retry_payload.pop("temperature", None)
                 r = requests.post(
@@ -3195,21 +3369,51 @@ def _external_api_chat_unlocked(
             if r.status_code >= 400:
                 raise RuntimeError(f"HTTP {r.status_code}: {_sanitize_api_error(r.text[:800])}")
             data = r.json()
-            choices = data.get("choices") if isinstance(data, dict) else None
-            if not isinstance(choices, list) or not choices:
-                raise RuntimeError(f"Некорректный ответ API: {_sanitize_api_error(data)}")
-            first_choice = choices[0] if isinstance(choices[0], dict) else {}
-            message = first_choice.get("message") if isinstance(first_choice, dict) else None
-            content = message.get("content") if isinstance(message, dict) else first_choice.get("text")
-            if isinstance(content, list):
-                # Совместимость с API, где content возвращается массивом частей.
-                content = "".join(
-                    str(part.get("text") or "") for part in content if isinstance(part, dict)
-                )
-            text = str(content or "").strip()
-            if not text:
-                raise RuntimeError("API вернул пустой content.")
-            return text
+            text, first_choice, message = _external_choice_text(data)
+            if text:
+                return text
+
+            # Универсальная страховка для reasoning-моделей неизвестного/custom
+            # провайдера: если ответ оборвался по лимиту или содержит только
+            # reasoning, один раз увеличиваем output budget и повторяем запрос.
+            if _empty_completion_needs_more_budget(first_choice, message):
+                retry_payload = dict(payload)
+                token_key = "max_completion_tokens" if "max_completion_tokens" in retry_payload else "max_tokens"
+                try:
+                    current_limit = int(retry_payload.get(token_key) or requested_max_tokens)
+                except Exception:
+                    current_limit = requested_max_tokens
+                bigger_limit = min(4096, max(2048, current_limit * 4))
+                if bigger_limit > current_limit:
+                    retry_payload[token_key] = bigger_limit
+                    retry_response = requests.post(
+                        url,
+                        headers=_api_headers(),
+                        json=retry_payload,
+                        timeout=(10, timeout),
+                        **_api_proxy_kwargs(),
+                    )
+                    if structured and retry_response.status_code in (400, 404, 422):
+                        last_error = RuntimeError(
+                            f"response_format не поддержан: HTTP {retry_response.status_code}"
+                        )
+                        continue
+                    if retry_response.status_code >= 400:
+                        raise RuntimeError(
+                            f"HTTP {retry_response.status_code}: "
+                            f"{_sanitize_api_error(retry_response.text[:800])}"
+                        )
+                    retry_data = retry_response.json()
+                    retry_text, first_choice, message = _external_choice_text(retry_data)
+                    if retry_text:
+                        return retry_text
+
+            finish_reason = str(first_choice.get("finish_reason") or "").strip()
+            suffix = f" (finish_reason={finish_reason})" if finish_reason else ""
+            raise RuntimeError(
+                "API вернул пустой content" + suffix
+                + ". Если модель reasoning, выберите более быстрый/не-thinking режим или увеличьте лимит ответа."
+            )
         except requests.exceptions.ReadTimeout as e:
             raise RuntimeError(
                 f"Облачный API не ответил за {timeout} сек. Увеличьте AI timeout или выберите более быструю модель."
@@ -8944,12 +9148,7 @@ def init_telegram(cardinal: "Cardinal") -> None:
         if key not in API_PRESETS:
             bot.answer_callback_query(call.id, "Неизвестный пресет", show_alert=True)
             return
-        SETTINGS["ai_provider"] = "openai_compatible"
-        SETTINGS["api_preset"] = key
-        preset_url = API_PRESETS[key][1]
-        if preset_url:
-            SETTINGS["api_base_url"] = preset_url
-        SETTINGS["setup_done"] = True
+        apply_api_preset(key)
         save_config()
         bot.answer_callback_query(call.id, f"Выбрано: {API_PRESETS[key][0]}")
         open_api(call)
@@ -9031,10 +9230,7 @@ def init_telegram(cardinal: "Cardinal") -> None:
         if not allowed:
             admin_reply(m, f"❌ {utils.escape(reason)}")
             return
-        SETTINGS["ai_provider"] = "openai_compatible"
-        SETTINGS["api_preset"] = "custom"
-        SETTINGS["api_base_url"] = url
-        SETTINGS["setup_done"] = True
+        apply_custom_api_url(url)
         save_config()
         admin_reply(m, "✅ API URL сохранён.", reply_markup=K().add(B("☁️ К API", callback_data=f"{CBT_PREFIX}:api")))
 

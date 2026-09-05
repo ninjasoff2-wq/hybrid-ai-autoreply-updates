@@ -56,9 +56,9 @@ if TYPE_CHECKING:
 # Метаданные плагина
 # ============================================================================
 NAME = "Hybrid AI AutoReply 🤖 | @revengezza"
-VERSION = "2.6.3"
+VERSION = "2.6.4"
 DESCRIPTION = (
-    "Умный AI-заместитель продавца FunPay v2.6.3: поддерживает локальную/удалённую Ollama, облачные "
+    "Умный AI-заместитель продавца FunPay v2.6.4: поддерживает локальную/удалённую Ollama, облачные "
     "OpenAI-совместимые API и отдельную вкладку бесплатных API-моделей без локальной нейросети; в гибридном режиме сначала использует подходящие шаблоны, "
     "а если шаблон не подошёл — продолжает той же безопасной AI-логикой, что и AI-only. "
     "Не путает бытовой small-talk с лотами даже при fuzzy-совпадениях в описаниях, помнит безопасную хронологию "
@@ -301,7 +301,7 @@ def _default_rules() -> list[dict[str, Any]]:
             "name": "💰 Цена",
             "enabled": True,
             "phrases": ["сколько стоит", "какая цена", "цена", "почем", "стоимость"],
-            "reply": "Цена лота «{product}» — {price} {currency}.",
+            "reply": "По лоту «{product}»: {buyer_price_text}",
             "requires_product": True,
         },
         {
@@ -449,7 +449,7 @@ def _migrate_system_rules(rules: list[Any]) -> list[dict[str, Any]]:
         "presence": "Да, я на связи 🤝",
         "purchase_permission": "По лоту «{product}»: {purchase_permission_text}",
         "availability": "По лоту «{product}»: {availability_text}",
-        "price": "Цена лота «{product}» — {price} {currency}.",
+        "price": "По лоту «{product}»: {buyer_price_text}",
         "thanks": "Пожалуйста! 🤝",
     }
     for rule in clean:
@@ -476,7 +476,7 @@ def _migrate_system_rules(rules: list[Any]) -> list[dict[str, Any]]:
 
 
 DEFAULTS: dict[str, Any] = {
-    "version": 24,
+    "version": 25,
     "enabled": True,
     "setup_done": False,
     # Сохраняем историческое имя ollama_enabled ради обратной совместимости:
@@ -865,6 +865,20 @@ def load_config() -> None:
         SETTINGS.setdefault("api_proxy_mode", "auto")
         SETTINGS.setdefault("api_proxy", "")
         SETTINGS["version"] = 24
+    if cfg_version < 25:
+        # v2.6.4: покупателю сообщаем итоговую минимальную цену с комиссией,
+        # если её вернул FunPay CalcResult. Старые штатные price-шаблоны
+        # обновляем, пользовательские формулировки не трогаем.
+        old_price_replies = {
+            "Цена лота «{product}» — {price} {currency}.",
+            "Цена лота «{product}» — {price} {currency}. Актуальная цена также указана на странице лота.",
+        }
+        for rule in SETTINGS.get("rules", []):
+            if not isinstance(rule, dict) or _infer_system_rule_key(rule) != "price":
+                continue
+            if str(rule.get("reply") or "") in old_price_replies:
+                rule["reply"] = "По лоту «{product}»: {buyer_price_text}"
+        SETTINGS["version"] = 25
     save_config()
 
 
@@ -1457,6 +1471,7 @@ def looks_product_dependent(text: str) -> bool:
         "выдач", "цена", "стоимость", "сколько стоит", "актуален", "актуально", "получу", "ключ",
         "аккаунт", "количество", "осталось", "гарант", "срок", "регион", "сервер", "платформ",
         "характерист", "описан", "что входит", "что получу", "подойдет", "подойдёт", "вариант",
+        "торг", "скидк", "дешевле", "уступ", "снизить цену", "снижение цены",
     )
     return any(w in n for w in words)
 
@@ -1474,6 +1489,21 @@ def is_price_question(text: str) -> bool:
     """Явный запрос цены, включая разговорное «сколько стоят / скок стоит»."""
     n = normalize_text(text)
     return bool(n and _PRICE_INTENT_LOCAL_RE.search(n))
+
+
+_DISCOUNT_QUERY_LOCAL_RE = re.compile(
+    r"(?:^|\b)(?:торг\w*|скидк\w*|дешевле|уступ\w*|"
+    r"сниз\w*\s+цен\w*|скин\w*\s+(?:цен\w*|до\b)|"
+    r"отдад\w*\s+(?:за|по)\s+\d+|сдела\w*\s+(?:за|по)\s+\d+|"
+    r"можно\s+(?:ли\s+)?(?:за|по)\s+\d+)(?:\b|$)",
+    re.I,
+)
+
+
+def is_discount_question(text: str) -> bool:
+    """Запрос торга/скидки/снижения цены, включая короткое «а торг есть?»."""
+    n = normalize_text(text)
+    return bool(n and _DISCOUNT_QUERY_LOCAL_RE.search(n))
 
 
 def is_quantity_purchase_question(text: str) -> bool:
@@ -1581,7 +1611,7 @@ def _price_rule() -> dict[str, Any]:
         "name": "💰 Цена",
         "enabled": True,
         "phrases": [],
-        "reply": "Цена лота «{product}» — {price} {currency}.",
+        "reply": "По лоту «{product}»: {buyer_price_text}",
         "requires_product": True,
     }
 
@@ -1702,8 +1732,14 @@ def _lot_basic(lot: Any) -> dict[str, Any]:
         "description": _obj_str(lot, "description"),
         "full_description": "",
         "payment_message": "",
+        # Базовая цена лота. Итог для покупателя может быть выше из-за
+        # комиссии/способа оплаты и хранится отдельно в buyer_price_min.
         "price": getattr(lot, "price", None),
         "currency": _currency_text(getattr(lot, "currency", "")),
+        "buyer_price_min": None,
+        "buyer_price_currency": "",
+        "buyer_price_source": "",
+        "buyer_price_updated_at": 0.0,
         "amount": getattr(lot, "amount", None),
         "auto_delivery_funpay": funpay_auto,
         "auto_delivery_text": False,
@@ -1721,6 +1757,39 @@ def _lot_basic(lot: Any) -> dict[str, Any]:
     }
     _refresh_auto_delivery_flags(data)
     return data
+
+
+def _calc_buyer_price(fields: Any) -> tuple[float | None, str]:
+    """Минимальная цена «от ...» для покупателя из FunPay CalcResult.
+
+    Актуальные FunPayAPI отдают её как ``min_price_with_commission``. Для
+    совместимости с близкими сборками умеем взять минимум из payment methods.
+    """
+    calc = getattr(fields, "calc_result", None)
+    if calc is None:
+        return None, ""
+
+    raw = getattr(calc, "min_price_with_commission", None)
+    currency = _currency_text(getattr(calc, "min_price_currency", ""))
+    try:
+        if raw is not None:
+            value = float(raw)
+            if value > 0:
+                return value, currency
+    except Exception:
+        pass
+
+    candidates: list[tuple[float, str]] = []
+    for method in list(getattr(calc, "methods", None) or []):
+        try:
+            value = float(getattr(method, "price", None))
+        except Exception:
+            continue
+        if value <= 0:
+            continue
+        method_currency = _currency_text(getattr(method, "currency", "")) or currency
+        candidates.append((value, method_currency))
+    return min(candidates, key=lambda item: item[0]) if candidates else (None, "")
 
 
 def _enrich_lot(c: "Cardinal", lot_id: str) -> None:
@@ -1749,6 +1818,12 @@ def _enrich_lot(c: "Cardinal", lot_id: str) -> None:
                 LOTS[lot_id]["active"] = bool(getattr(fields, "active"))
             if getattr(fields, "price", None) is not None:
                 LOTS[lot_id]["price"] = getattr(fields, "price")
+            buyer_price, buyer_currency = _calc_buyer_price(fields)
+            if buyer_price is not None:
+                LOTS[lot_id]["buyer_price_min"] = buyer_price
+                LOTS[lot_id]["buyer_price_currency"] = buyer_currency or LOTS[lot_id].get("currency", "")
+                LOTS[lot_id]["buyer_price_source"] = "funpay_calc"
+                LOTS[lot_id]["buyer_price_updated_at"] = time.time()
             if getattr(fields, "amount", None) is not None:
                 LOTS[lot_id]["amount"] = getattr(fields, "amount")
     except Exception:
@@ -1774,8 +1849,11 @@ def sync_lots(c: "Cardinal", enrich: bool = True) -> int:
         # Сохраняем уже загруженные полные описания до фонового обновления.
         for lid, old in LOTS.items():
             if lid in new_cache:
-                for k in ("full_description", "payment_message"):
-                    if old.get(k) and not new_cache[lid].get(k):
+                for k in (
+                    "full_description", "payment_message", "buyer_price_min",
+                    "buyer_price_currency", "buyer_price_source", "buyer_price_updated_at",
+                ):
+                    if old.get(k) not in (None, "", 0.0) and new_cache[lid].get(k) in (None, "", 0.0):
                         new_cache[lid][k] = old[k]
                 _refresh_auto_delivery_flags(new_cache[lid])
         LOTS.clear()
@@ -2434,12 +2512,75 @@ def purchase_permission_text(lot: dict[str, Any] | None) -> str:
     return "Да, этот лот доступен для покупки ✅"
 
 
+def _money_display(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        number = float(str(value).strip().replace(",", "."))
+        return f"{number:.2f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(value)
+
+
+def buyer_price_reply(lot: dict[str, Any] | None) -> str:
+    """Цена, которую корректно сообщать покупателю до оформления заказа."""
+    if not lot:
+        return "Сначала нужно определить, о каком товаре идёт речь."
+    buyer_price = lot.get("buyer_price_min")
+    buyer_currency = str(lot.get("buyer_price_currency") or lot.get("currency") or "")
+    if buyer_price is not None:
+        return (
+            f"Для покупателя — от {_money_display(buyer_price)} {buyer_currency}. "
+            "Это минимальная итоговая сумма с комиссией FunPay; точная сумма зависит от способа оплаты."
+        ).strip()
+    base_price = lot.get("price")
+    base_currency = str(lot.get("currency") or "")
+    if base_price is not None:
+        return (
+            f"Базовая цена лота — {_money_display(base_price)} {base_currency}. "
+            "Итоговая сумма для покупателя с комиссией зависит от способа оплаты и отображается FunPay при оплате."
+        ).strip()
+    return "Точная цена для покупателя сейчас не получена; она отображается FunPay при оформлении оплаты."
+
+
+_DISCOUNT_NEGATIVE_LOT_RE = re.compile(
+    r"(?:без\s+торг\w*|торг\w*\s+(?:нет|не\s+будет)|не\s+торгуюсь|"
+    r"цен\w*\s+(?:окончательн\w*|фиксированн\w*)|скидок\s+нет)", re.I
+)
+_DISCOUNT_POSITIVE_LOT_RE = re.compile(
+    r"(?:торг\w*\s+(?:есть|возможен|уместен|допустим)|возможен\s+торг|"
+    r"скидк\w*\s+(?:есть|возможн\w*|предусмотрен\w*)|можно\s+поторговаться)", re.I
+)
+
+
+def discount_reply(lot: dict[str, Any] | None) -> str:
+    if not lot:
+        return "Уточните, пожалуйста, по какому лоту вы спрашиваете про торг или скидку."
+    lid = str(lot.get("id") or "")
+    text = "\n".join([
+        _sanitize_product_context(str(lot.get("title") or "")),
+        _sanitize_product_context(str(lot.get("description") or "")),
+        _sanitize_product_context(str(lot.get("full_description") or "")),
+        _sanitize_product_context(str((SETTINGS.get("lot_notes") or {}).get(lid, "") or "")),
+    ])
+    if _DISCOUNT_NEGATIVE_LOT_RE.search(text):
+        return "Нет — в информации этого лота указана фиксированная цена без торга."
+    if _DISCOUNT_POSITIVE_LOT_RE.search(text):
+        return "Да, в информации лота указана возможность торга/скидки. Конкретную цену нужно согласовать с продавцом."
+    return "В информации этого лота условия торга или скидки не указаны. Можете предложить свою цену — продавец решит, возможна ли уступка."
+
+
 def product_vars(lot: dict[str, Any] | None) -> dict[str, str]:
     if not lot:
         return {
             "product": "этот товар",
             "price": "—",
             "currency": "",
+            "seller_price": "—",
+            "seller_currency": "",
+            "buyer_price_min": "—",
+            "buyer_price_currency": "",
+            "buyer_price_text": "Сначала нужно определить, о каком товаре идёт речь.",
             "amount": "—",
             "autodelivery_text": "Информация об автовыдаче не определена.",
             "availability_text": "Наличие нужно уточнить.",
@@ -2474,10 +2615,23 @@ def product_vars(lot: dict[str, Any] | None) -> dict[str, str]:
         auto_text = "Автовыдача на этом лоте не обнаружена; выдача выполняется по условиям лота."
     note = _sanitize_product_context(SETTINGS.get("lot_notes", {}).get(str(lot.get("id")), ""))
     safe_title = _sanitize_product_context(str(lot.get("title") or lot.get("description") or f"лот #{lot.get('id')}"))
+    buyer_price = lot.get("buyer_price_min")
+    buyer_currency = str(lot.get("buyer_price_currency") or lot.get("currency") or "")
+    base_price = lot.get("price")
+    base_currency = str(lot.get("currency") or "")
+    effective_price = buyer_price if buyer_price is not None else base_price
+    effective_currency = buyer_currency if buyer_price is not None else base_currency
     return {
         "product": safe_title or "этот товар",
-        "price": "—" if lot.get("price") is None else str(lot.get("price")),
-        "currency": str(lot.get("currency") or ""),
+        # Старые пользовательские {price}/{currency} по возможности получают
+        # именно минимальную покупательскую цену, а не базовую цену продавца.
+        "price": _money_display(effective_price),
+        "currency": effective_currency,
+        "seller_price": _money_display(base_price),
+        "seller_currency": base_currency,
+        "buyer_price_min": _money_display(buyer_price),
+        "buyer_price_currency": buyer_currency,
+        "buyer_price_text": buyer_price_reply(lot),
         "amount": _amount_display(amount),
         "autodelivery_text": auto_text,
         "availability_text": availability,
@@ -3746,7 +3900,8 @@ def _lot_prompt(lot: dict[str, Any] | None) -> str:
     return (
         f"Название: {v['product']}\n"
         f"Категория: {v['subcategory']}\n"
-        f"Цена: {v['price']} {v['currency']}\n"
+        f"Базовая цена лота: {v['seller_price']} {v['seller_currency']}\n"
+        f"Цена для покупателя: {v['buyer_price_text']}\n"
         f"Количество: {v['amount']}\n"
         f"Автовыдача: {'да' if lot.get('auto_delivery') else 'нет'} (источник: {lot.get('auto_delivery_source') or 'none'})\n"
         f"Сервер: {v['server']}\nСторона: {v['side']}\n"
@@ -4928,6 +5083,7 @@ def _is_obvious_non_product_dialogue(chat_id: Any, text: str) -> bool:
     business = bool(
         is_quantity_purchase_question(text)
         or is_price_question(text)
+        or is_discount_question(text)
         or is_purchase_permission_question(text)
         or _looks_like_natural_availability_question(text)
         or looks_product_dependent(text)
@@ -5811,6 +5967,13 @@ def _outbound_safety_violation(text: str) -> str:
 
 # Некоторые маленькие модели даже при think=false могут печатать внутренние
 # рассуждения прямо в message.content. Такие ответы покупателю не показываем.
+_MODEL_SAFETY_LABEL_RE = re.compile(
+    r"(?:^|\n)\s*(?:user|response|assistant|content|prompt)\s+safety\s*:\s*"
+    r"(?:safe|unsafe|allowed|blocked|refused)\s*(?:$|\n)",
+    re.I,
+)
+
+
 _META_REASONING_RE = re.compile(
     r"(?:<think>|</think>|\bмне\s+нужно\s+ответить\b|\bсначала\s+(?:я\s+)?проверю\b|"
     r"\bпроверю\s+правил\w*\b|\bправило\s*№?\s*\d+\b|"
@@ -6200,6 +6363,8 @@ def _authoritative_ai_source(lot: dict[str, Any] | None, seller_info: str) -> st
             _sanitize_product_context(str(lot.get("description") or "")),
             _sanitize_product_context(str(lot.get("full_description") or "")),
             str(lot.get("price") or ""),
+            str(lot.get("buyer_price_min") or ""),
+            _sanitize_confidential_context(str(lot.get("buyer_price_currency") or "")),
             str(lot.get("amount") if lot.get("amount") is not None else ""),
             _sanitize_confidential_context(str(lot.get("currency") or "")),
             _sanitize_product_context(str(lot.get("subcategory") or "")),
@@ -6222,6 +6387,8 @@ def _lot_authoritative_source(lot: dict[str, Any] | None) -> str:
         _sanitize_product_context(str(lot.get("description") or "")),
         _sanitize_product_context(str(lot.get("full_description") or "")),
         str(lot.get("price") or ""),
+        str(lot.get("buyer_price_min") or ""),
+        _sanitize_confidential_context(str(lot.get("buyer_price_currency") or "")),
         str(lot.get("amount") if lot.get("amount") is not None else ""),
         _sanitize_confidential_context(str(lot.get("currency") or "")),
         _sanitize_product_context(str(lot.get("subcategory") or "")),
@@ -6302,10 +6469,15 @@ def validate_ai_answer(
     privacy_violation = _outbound_safety_violation(text)
     if privacy_violation:
         return False, f"privacy/funpay guard: {privacy_violation}"
-    if not SETTINGS.get("strict_grounding", True):
-        return True, ""
+    # Некоторые safety/reasoning-модели вместо ответа печатают служебный
+    # классификатор: «User Safety: safe / Response Safety: safe». Это не
+    # пользовательский ответ и блокируется независимо от strict_grounding.
+    if _MODEL_SAFETY_LABEL_RE.search(text):
+        return False, "модель вернула служебную safety-классификацию вместо ответа"
     if _META_REASONING_RE.search(text):
         return False, "модель вывела внутреннее рассуждение/служебный контекст"
+    if not SETTINGS.get("strict_grounding", True):
+        return True, ""
     if _AI_TECH_RE.search(text):
         return False, "модель упомянула внутреннюю AI-технологию вместо ответа покупателю"
     if _OTHER_MARKET_RE.search(text):
@@ -6391,12 +6563,11 @@ def grounded_fallback_reply(buyer_text: str, lot: dict[str, Any] | None) -> str:
         if lot:
             return quantity_purchase_text(lot)
         return "Уточните, пожалуйста, для какого лота нужно проверить доступное количество."
+    if is_discount_question(buyer_text):
+        return discount_reply(lot)
     if is_price_question(buyer_text):
         if lot:
-            values = product_vars(lot)
-            price = values.get("price", "—")
-            currency = values.get("currency", "")
-            return f"Цена этого лота — {price} {currency}.".strip()
+            return buyer_price_reply(lot)
         return "Уточните, пожалуйста, цену какого лота нужно проверить."
 
     if lot:
@@ -6613,6 +6784,8 @@ small_talk | product | purchase | order_help | seller_public | seller_call | gen
 1. Отвечай кратко, естественно и по существу, обычно 1–3 предложения.
 2. Если вопрос разрешён и ответ известен — отвечай прямо. Не отказывай просто из-за необычного стиля сообщения.
 3. Не добавляй без запроса цену, наличие, количество, автовыдачу, сроки, гарантии, рекламу, призыв купить или иной факт.
+- На вопрос о цене используй строку «Цена для покупателя». «Базовая цена лота» не является итогом к оплате и не должна выдаваться покупателю как конечная цена.
+- Никогда не выводи служебные метки модерации/классификации вроде «User Safety: safe», «Response Safety: safe» или policy labels. Покупателю нужен только естественный ответ.
 4. Не выдумывай цену, наличие, количество, сроки, гарантии, скидки, свойства товара, рабочее время, состояние заказа
    или действия продавца.
 5. Для action="answer" с конкретным seller/product-фактом укажи source и evidence. evidence — короткий ТОЧНЫЙ
@@ -7193,6 +7366,8 @@ def ollama_answer(
 11. Не упоминай цену, количество, срок, гарантию или другой факт просто «для справки», если это не отвечает на текущий вопрос покупателя. Не подтягивай случайные детали из истории разговора.
 12. Перед отправкой мысленно проверь каждое число и каждый конкретный факт: он должен присутствовать в подтверждённых данных ниже.
 13. Не добавляй сведения «к слову»: цену, наличие, сроки, автовыдачу, гарантию, рекламу и другие детали сообщай только когда они отвечают на текущий вопрос.
+14. На вопрос о цене используй «Цена для покупателя» из блока текущего товара. «Базовая цена лота» не является итогом к оплате; если покупательская цена не рассчитана, объясни зависимость от комиссии/способа оплаты.
+15. Никогда не выводи служебные строки классификатора/модерации вроде «User Safety: safe» или «Response Safety: safe» — только нормальный ответ покупателю.
 
 {memory_block}
 Эта память содержит только очищенные слова покупателя. Она помогает понимать «а ты?», «а по второму?»,
@@ -7359,6 +7534,8 @@ def api_answer(
 11. Не упоминай цену, количество, срок, гарантию или другой факт просто «для справки», если это не отвечает на текущий вопрос покупателя. Не подтягивай случайные детали из истории разговора.
 12. Перед отправкой мысленно проверь каждое число и каждый конкретный факт: он должен присутствовать в подтверждённых данных ниже.
 13. Не добавляй сведения «к слову»: цену, наличие, сроки, автовыдачу, гарантию, рекламу и другие детали сообщай только когда они отвечают на текущий вопрос.
+14. На вопрос о цене используй «Цена для покупателя» из блока текущего товара. «Базовая цена лота» не является итогом к оплате; если покупательская цена не рассчитана, объясни зависимость от комиссии/способа оплаты.
+15. Никогда не выводи служебные строки классификатора/модерации вроде «User Safety: safe» или «Response Safety: safe» — только нормальный ответ покупателю.
 
 {memory_block}
 Эта память содержит только очищенные слова покупателя. Она помогает понимать продолжения, но не подтверждает seller/product-факты.
@@ -7947,6 +8124,18 @@ def process_buyer_message(
             # Ни AI, ни память старого чата не имеют права угадывать товар.
             _clarify(c, m, product=True, original_text=buyer_text)
             return
+
+    # При первом сообщении после запуска базовый кэш может быть ещё без
+    # CalcResult/полного описания. Для цены и торга обогащаем только выбранный
+    # лот, чтобы не ждать фонового прохода всех лотов.
+    if lot is not None and (is_price_question(buyer_text) or is_discount_question(buyer_text)):
+        need_price_calc = is_price_question(buyer_text) and lot.get("buyer_price_min") is None
+        need_full_desc = is_discount_question(buyer_text) and not str(lot.get("full_description") or "").strip()
+        if need_price_calc or need_full_desc:
+            try:
+                _enrich_lot(c, str(lot.get("id") or ""))
+            except Exception:
+                logger.debug(f"{LOG_PREFIX} Не удалось обогатить выбранный лот перед ответом о цене/торге.", exc_info=True)
 
     conf = overall_confidence(buyer_text, rscore, pscore)
     logger.info(
@@ -10276,7 +10465,7 @@ def init_telegram(cardinal: "Cardinal") -> None:
             "1️⃣5️⃣ В карточке каждого лота можно вручную включить <b>🔒 Автосценарий / AI OFF</b>. После покупки такого лота "
             "Hybrid AI не отвечает в этом чате, пока заказ не закрыт/подтверждён либо пока владелец вручную не снимет lock — "
             "в зависимости от режима. Отдельные плагины автовыдачи этим lock не блокируются.\n\n"
-            "1️⃣6️⃣ В v2.6.3 облачный transport учитывает различия reasoning-моделей у Groq, OpenRouter, Gemini, OpenAI, DeepSeek и Together. "
+            "1️⃣6️⃣ В v2.6.4 исправлены цена для покупателя с комиссией, ответы про торг и служебные safety-строки моделей. "
             "Если совместимый API вернул только reasoning или остановился по лимиту без видимого content, запрос один раз повторяется с увеличенным budget. "
             "При смене API-провайдера или Custom URL прежние ключ и модель не переносятся автоматически — после переключения проверьте ключ/модель и нажмите <b>🧪 Тест API</b>.\n\n"
             "🌐 <b>Ollama на другом ПК</b>\n"

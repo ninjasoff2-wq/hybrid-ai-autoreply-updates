@@ -56,13 +56,14 @@ if TYPE_CHECKING:
 # Метаданные плагина
 # ============================================================================
 NAME = "Hybrid AI AutoReply 🤖 | @revengezza"
-VERSION = "2.6.6"
+VERSION = "2.6.7"
 DESCRIPTION = (
-    "Умный AI-заместитель продавца FunPay v2.6.6: поддерживает локальную/удалённую Ollama, облачные "
+    "Умный AI-заместитель продавца FunPay v2.6.7: поддерживает локальную/удалённую Ollama, облачные "
     "OpenAI-совместимые API и отдельную вкладку бесплатных API-моделей без локальной нейросети; в гибридном режиме сначала использует подходящие шаблоны, "
     "а если шаблон не подошёл — продолжает той же безопасной AI-логикой, что и AI-only. "
     "Диалог имеет приоритет над навязчивым выбором лота: точный товар запрашивается только для фактов, которые без него нельзя проверить; "
     "короткие продолжения используют недавно подтверждённый лот, а водяные метки отдельно настраиваются для AI-ответов, AI-шаблонов, локальных шаблонов и служебных автоответов. "
+    "Fact Guard 2.0 блокирует выдуманные seller/product-факты, но чинит ошибочный source у безопасного общего диалога; стандартная AI-метка компактная — «🤖 ИИ». "
     "Факты о продавце и лоте берутся только из подтверждённых seller/product/buyer-источников; для общих терминов доступен контекстный поиск по открытым источникам; история хранится уже очищенной, "
     "конфиденциальные данные и контакты отсекаются до AI, в логах и перед отправкой, а seller-only role guard "
     "не даёт плагину отвечать, пока покупка текущего аккаунта активна; после подтверждения такой заказ больше не блокирует чат. Для вручную отмеченных автотоваров "
@@ -477,7 +478,7 @@ def _migrate_system_rules(rules: list[Any]) -> list[dict[str, Any]]:
 
 
 DEFAULTS: dict[str, Any] = {
-    "version": 28,
+    "version": 29,
     "enabled": True,
     "setup_done": False,
     # Сохраняем историческое имя ollama_enabled ради обратной совместимости:
@@ -576,14 +577,14 @@ DEFAULTS: dict[str, Any] = {
     # Водяные метки настраиваются отдельно по источнику ответа. Старые ключи
     # ai_watermark_* сохранены для обратной совместимости и относятся к свободным AI-ответам.
     "ai_watermark_enabled": True,
-    "ai_watermark_text": "🤖 Ответ сгенерирован ИИ",
+    "ai_watermark_text": "🤖 ИИ",
     "ai_template_watermark_enabled": False,
-    "ai_template_watermark_text": "🤖 Ответ по AI-шаблону",
+    "ai_template_watermark_text": "🧠 AI",
     "local_template_watermark_enabled": False,
-    "local_template_watermark_text": "🧩 Автоответ по шаблону",
+    "local_template_watermark_text": "🧩 Авто",
     "system_watermark_enabled": False,
-    "system_watermark_text": "⚙️ Автоматический ответ",
-    "unknown_reply": "В доступной информации нет точного ответа на этот вопрос. Уточните, пожалуйста, что именно нужно узнать.",
+    "system_watermark_text": "⚙️ Авто",
+    "unknown_reply": "Не уверен, что правильно понял вопрос. Уточните, пожалуйста, одним сообщением, что именно хотите узнать.",
     "product_clarify_reply": (
         "Какой именно товар / лот вы имеете в виду? Для точного ответа по этому вопросу нужен конкретный лот. "
         "Напишите название или отличающий вариант; также можно просто открыть нужный лот на FunPay. "
@@ -945,6 +946,22 @@ def load_config() -> None:
         SETTINGS.setdefault("system_watermark_enabled", False)
         SETTINGS.setdefault("system_watermark_text", "⚙️ Автоматический ответ")
         SETTINGS["version"] = 28
+    if cfg_version < 29:
+        # v2.6.7: компактные метки и dialogue/grounding repair. Меняем только
+        # штатные тексты старых меток; пользовательские подписи не перезаписываем.
+        watermark_migration = {
+            "ai_watermark_text": ("🤖 Ответ сгенерирован ИИ", "🤖 ИИ"),
+            "ai_template_watermark_text": ("🤖 Ответ по AI-шаблону", "🧠 AI"),
+            "local_template_watermark_text": ("🧩 Автоответ по шаблону", "🧩 Авто"),
+            "system_watermark_text": ("⚙️ Автоматический ответ", "⚙️ Авто"),
+        }
+        old_unknown_reply = "В доступной информации нет точного ответа на этот вопрос. Уточните, пожалуйста, что именно нужно узнать."
+        if str(SETTINGS.get("unknown_reply") or "") == old_unknown_reply:
+            SETTINGS["unknown_reply"] = DEFAULTS["unknown_reply"]
+        for key, (old_value, new_value) in watermark_migration.items():
+            if str(SETTINGS.get(key) or "") == old_value:
+                SETTINGS[key] = new_value
+        SETTINGS["version"] = 29
     save_config()
 
 
@@ -1615,7 +1632,7 @@ def is_price_question(text: str) -> bool:
 
 
 _DISCOUNT_QUERY_LOCAL_RE = re.compile(
-    r"(?:^|\b)(?:торг\w*|скидк\w*|дешевле|уступ\w*|"
+    r"(?:^|\b)(?:торг\w*|скидк\w*|дешевле|уступ\w*|бесплатн\w*|даром|за\s+так|"
     r"сниз\w*\s+цен\w*|скин\w*\s+(?:цен\w*|до\b)|"
     r"отдад\w*\s+(?:за|по)\s+\d+|сдела\w*\s+(?:за|по)\s+\d+|"
     r"можно\s+(?:ли\s+)?(?:за|по)\s+\d+)(?:\b|$)",
@@ -1777,12 +1794,91 @@ _AVAILABILITY_NATURAL_RE = re.compile(
 )
 
 
+_NON_PRODUCT_EXISTENCE_DIALOGUE_RE = re.compile(
+    r"(?iu)^\s*(?:(?:у\s+(?:вас|тебя)\s+)?есть\s+)?"
+    r"(?:(?:один|небольшой|маленький)\s+)?"
+    r"(?:вопрос|вопросик|просьба|проблема|идея|минутка|время|шанс|возможность)"
+    r"(?:\s+(?:к\s+вам|к\s+тебе|для\s+вас))?[?!.]*\s*$"
+)
+
+
+def _is_non_product_existence_dialogue(text: str) -> bool:
+    return bool(_NON_PRODUCT_EXISTENCE_DIALOGUE_RE.match(normalize_text(text)))
+
+
 def _looks_like_natural_availability_question(text: str) -> bool:
     """Разговорное «есть <товар>?»; товарность подтверждается каталогом позже."""
     n = normalize_text(text)
     if not n or is_seller_lot_count_question(text) or is_presence_question(text):
         return False
+    if _is_non_product_existence_dialogue(text):
+        return False
     return bool(_AVAILABILITY_NATURAL_RE.search(n))
+
+
+_CATALOG_EXISTENCE_PREFIX_RE = re.compile(
+    r"(?iu)^\s*(?:(?:а|ну|подскажите|скажите|скажите\s+пожалуйста)\s+)*"
+    r"(?:(?:у\s+вас\s+)?(?:есть|имеется|имеются)(?:\s+ли)?|"
+    r"(?:прода[её]те|продаешь|продаете|есть\s+в\s+продаже))\s+(.+?)[?!.]*\s*$"
+)
+
+
+def _catalog_existence_subject(text: str) -> str:
+    """Возвращает название товара из seller-wide вопроса «у вас есть X?».
+
+    Это отдельный discovery-intent: отсутствие точного совпадения в каталоге не
+    должно превращаться ни в случайный buyer_viewing, ни в выдуманное «да/нет».
+    """
+    n = normalize_text(text)
+    match = _CATALOG_EXISTENCE_PREFIX_RE.match(n)
+    if not match:
+        return ""
+    subject = match.group(1).strip()
+    subject = re.sub(r"(?iu)\b(?:в\s+наличии|сейчас|случайно|какие[- ]?нибудь)\b", " ", subject)
+    subject = _RE_SPACE.sub(" ", subject).strip()
+    if not subject or subject in {"это", "такое", "что нибудь", "что-нибудь"}:
+        return ""
+    # «Есть один вопрос / есть просьба / есть минутка?» — обычный диалог, а не
+    # поиск товара по каталогу. Без этого availability-детектор мог увести такие
+    # фразы в выбор лота ещё до AI.
+    if re.fullmatch(
+        r"(?iu)(?:(?:один|небольшой|маленький)\s+)?(?:вопрос|вопросик|просьба|проблема|идея|минутка|время|шанс|возможность)",
+        subject,
+    ):
+        return ""
+    return subject
+
+
+def _requires_specific_product_fact(text: str) -> bool:
+    """Нужен ли точный лот, чтобы ответ не был гаданием.
+
+    В отличие от широкого ``looks_product_dependent`` не считает одно слово
+    «аккаунт/лот/товар» достаточной причиной привязать произвольную реплику к
+    открытому buyer_viewing.
+    """
+    n = normalize_text(text)
+    if not n:
+        return False
+    if any((
+        is_price_question(text),
+        is_quantity_purchase_question(text),
+        is_purchase_permission_question(text),
+        is_discount_question(text),
+    )):
+        return True
+    if _looks_like_natural_availability_question(text):
+        # «У вас есть X?» — seller-wide поиск по реальному каталогу, а не факт
+        # текущего buyer_viewing. А короткое «есть в наличии?» без названия X
+        # по-прежнему требует конкретный лот.
+        return not bool(_catalog_existence_subject(text))
+    if re.search(
+        r"(?iu)\b(?:гарант\w*|автовыдач\w*|выдач\w*|срок\w*|регион\w*|сервер\w*|"
+        r"платформ\w*|характерист\w*|описан\w*|что\s+входит|что\s+получу|комплект\w*|"
+        r"уровень\w*|левел\w*|ранг\w*|скин\w*|инвентар\w*|привяз\w*|перепривяз\w*)\b",
+        n,
+    ) and (looks_like_question(text) or len(n.split()) <= 9):
+        return True
+    return False
 
 
 def overall_confidence(text: str, rule_score: float, product_score: float) -> float:
@@ -2059,6 +2155,26 @@ def lot_refresh_worker(c: "Cardinal") -> None:
             logger.debug("TRACEBACK", exc_info=True)
 
 
+_RU_PRODUCT_TRANSLIT = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ж": "zh",
+    "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n",
+    "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f",
+    "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch", "ъ": "",
+    "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+})
+
+
+def _latinize_product_token(token: str) -> str:
+    """Канонический ключ токена для смешанной кириллицы/латиницы.
+
+    Нужен прежде всего для названий игр/сервисов: ``Standoff`` ↔ ``стандофф``,
+    ``Steam`` ↔ ``стим`` и похожих пользовательских написаний. Русские слова
+    тоже становятся латиницей, поэтому поиск остаётся симметричным: кандидат и
+    запрос проходят одну и ту же функцию.
+    """
+    return str(token or "").translate(_RU_PRODUCT_TRANSLIT)
+
+
 def _product_match_token(token: str) -> str:
     """Нормализация токена для поиска лотов без внешних stemmer-библиотек."""
     t = normalize_text(token).replace(" ", "")
@@ -2073,6 +2189,8 @@ def _product_match_token(token: str) -> str:
         "tiktok": "tiktok", "тикток": "tiktok", "tik_tok": "tiktok",
         "instagram": "instagram", "инстаграм": "instagram", "инста": "instagram",
         "youtube": "youtube", "ютуб": "youtube",
+        "steam": "steam", "стим": "steam",
+        "standoff": "standoff", "стандофф": "standoff", "стендофф": "standoff",
         "день": "дн", "дня": "дн", "дней": "дн", "дн": "дн",
         "day": "дн", "days": "дн",
         "неделя": "недел", "недели": "недел", "недель": "недел",
@@ -2080,7 +2198,8 @@ def _product_match_token(token: str) -> str:
         "месяц": "месяц", "месяца": "месяц", "месяцев": "месяц",
         "month": "месяц", "months": "месяц",
     }
-    return aliases.get(t, t)
+    canonical = aliases.get(t, t)
+    return _latinize_product_token(canonical)
 
 
 def _product_tokens(text: str) -> list[str]:
@@ -2180,15 +2299,21 @@ def _has_explicit_product_reference(text: str) -> bool:
     # Чистый бытовой диалог никогда не является названием товара. Это отдельный
     # hard-guard от совпадений вроде «привет» со словом из full_description лота.
     # Смешанные сообщения («спасибо, а сколько стоит ...?») сюда не попадают.
-    if _is_obvious_non_product_dialogue("", text):
+    if _is_obvious_non_product_dialogue("", text) or _is_non_product_existence_dialogue(text):
         return False
     q = _product_tokens(text)
     if not q:
         return False
     # Эти слова описывают свойство текущего лота и сами по себе не идентифицируют товар.
     property_only = {
-        "автовыдача", "автовыдач", "выдача", "выдач", "гарантия", "гарантии",
-        "срок", "сроки", "быстро", "моментально", "автоматически",
+        _product_match_token(x) for x in {
+            "автовыдача", "автовыдач", "выдача", "выдач", "гарантия", "гарантии",
+            "срок", "сроки", "быстро", "моментально", "автоматически",
+            # Слишком общие слова сами по себе не являются названием товара.
+            # «приобретение аккаунта» не должно приклеиваться к открытому аккаунтному лоту.
+            "аккаунт", "аккаунты", "игра", "игры", "услуга", "услуги",
+            "приобретение", "покупка", "вариант",
+        }
     }
     identity = [t for t in q if t not in property_only]
     return bool(identity)
@@ -2337,7 +2462,7 @@ def _pending_product_get(chat_id: Any) -> dict[str, Any] | None:
     return item
 
 
-def _pending_product_set(m: Any, original_text: str) -> None:
+def _pending_product_set(m: Any, original_text: str, *, selection_only: bool = False) -> None:
     key = str(getattr(m, "chat_id", "") or "")
     if not key:
         return
@@ -2347,6 +2472,7 @@ def _pending_product_set(m: Any, original_text: str) -> None:
             "original_text": str(original_text or "").strip(),
             "candidates": [],
             "attempts": 0,
+            "selection_only": bool(selection_only),
         }
 
 
@@ -2452,21 +2578,96 @@ def _clear_pending_for_independent_message(m: Any, reason: str) -> None:
     logger.info(f"{LOG_PREFIX} chat={chat_key} pending_product_cleared={reason}")
 
 
+_PRODUCT_CHOICE_WORDS: dict[str, int] = {
+    "первый": 0, "первое": 0, "первую": 0, "первого": 0,
+    "второй": 1, "второе": 1, "вторую": 1, "второго": 1,
+    "третий": 2, "третье": 2, "третью": 2, "третьего": 2,
+    "четвертый": 3, "четвертое": 3, "четвертую": 3, "четвертого": 3,
+    "пятый": 4, "пятое": 4, "пятую": 4, "пятого": 4,
+}
+
+
 def _number_choice(text: str) -> int | None:
+    """Номер варианта, включая естественные фразы вроде «вау, дай 1 бесплатно».
+
+    Свободное число внутри длинной фразы не считаем выбором без selection-cue,
+    чтобы ``20 уровень`` или ``за 2 рубля`` не выбирали случайный кандидат.
+    """
     n = normalize_text(text)
-    mapping = {
-        "1": 0, "первый": 0, "первое": 0, "первую": 0,
-        "2": 1, "второй": 1, "второе": 1, "вторую": 1,
-        "3": 2, "третий": 2, "третье": 2, "третью": 2,
-        "4": 3, "четвертый": 3, "четвёртый": 3, "четвертое": 3, "четвёртое": 3,
-        "5": 4, "пятый": 4, "пятое": 4, "пятую": 4,
-    }
-    if n in mapping:
-        return mapping[n]
-    m = re.fullmatch(r"(?:лот\s*)?#?([1-5])", n)
-    return int(m.group(1)) - 1 if m else None
+    if not n:
+        return None
+    if n in {str(i) for i in range(1, 6)}:
+        return int(n) - 1
+    if n in _PRODUCT_CHOICE_WORDS:
+        return _PRODUCT_CHOICE_WORDS[n]
+    m = re.fullmatch(r"(?:(?:лот|вариант)\s*)?#?([1-5])(?:\s*(?:й|ый|ой))?", n)
+    if m:
+        return int(m.group(1)) - 1
+
+    # Номер в начале: «1 бесплатно», «#2 пожалуйста».
+    m = re.match(r"^(?:лот\s*|вариант\s*)?#?([1-5])(?:\s*(?:й|ый|ой))?(?:\b|\s)", n)
+    if m:
+        return int(m.group(1)) - 1
+
+    # Разговорный выбор: «дай 1», «беру второй», «хочу вариант 3».
+    cue = r"(?:дай|дайте|беру|возьму|хочу|выбираю|выберу|мне|давай|давайте|пусть\s+будет)"
+    m = re.search(rf"(?:^|\b){cue}\s+(?:(?:лот|вариант)\s*)?#?([1-5])(?:\s*(?:й|ый|ой))?(?:\b|$)", n)
+    if m:
+        return int(m.group(1)) - 1
+    for word, index in _PRODUCT_CHOICE_WORDS.items():
+        if re.search(rf"(?:^|\b){cue}\s+(?:(?:лот|вариант)\s*)?{re.escape(word)}(?:\b|$)", n):
+            return index
+    return None
 
 
+def _selection_followup_text(text: str, choice: int | None) -> str:
+    """Остаток фразы после выбора номера, если там есть новый вопрос/условие."""
+    if choice is None:
+        return ""
+    value = normalize_text(text)
+    number = str(choice + 1)
+    value = re.sub(rf"(?<!\d)#?{re.escape(number)}(?:\s*(?:й|ый|ой))?(?!\d)", " ", value, count=1)
+    for word, index in _PRODUCT_CHOICE_WORDS.items():
+        if index == choice:
+            value = re.sub(rf"\b{re.escape(word)}\b", " ", value, count=1)
+            break
+    value = re.sub(r"\b(?:лот|вариант)\b", " ", value, count=1)
+    value = _RE_SPACE.sub(" ", value).strip(" ,.!?-:")
+    if not value or value in {"ок", "окей", "да", "пожалуйста", "спасибо", "вау"}:
+        return ""
+    # Новый смысл после номера важнее исходного вопроса только если это реальный
+    # вопрос/условие сделки. Иначе номер остаётся обычным ответом на clarification.
+    if any((
+        looks_like_question(value),
+        is_price_question(value),
+        is_discount_question(value),
+        is_quantity_purchase_question(value),
+        is_purchase_permission_question(value),
+        _looks_like_natural_availability_question(value),
+        looks_product_dependent(value),
+    )):
+        return value
+    return ""
+
+
+_PRODUCT_SWITCH_RE = re.compile(
+    r"(?iu)(?:^|\b)(?:друг(?:ой|ая|ое|ие|ого|ую)\s+(?:лот|товар|вариант|аккаунт)|"
+    r"(?:лот|товар|вариант|аккаунт)\s+друг(?:ой|ого)|"
+    r"другой\s+хочу|хочу\s+другой|не\s+этот|не\s+этого|"
+    r"покажи(?:те)?\s+(?:ещ[её]|другой)|ещ[её]\s+(?:один|вариант|лот|товар)|"
+    r"мне\s+интерес(?:ен|на|но)\s+другой)\b"
+)
+
+
+def _is_product_switch_request(text: str) -> bool:
+    return bool(_PRODUCT_SWITCH_RE.search(normalize_text(text)))
+
+
+def _product_switch_query(text: str) -> str:
+    n = normalize_text(text)
+    n = _PRODUCT_SWITCH_RE.sub(" ", n)
+    n = re.sub(r"(?iu)\b(?:мне|я|интересует|интересен|хочу|пожалуйста|покажи|покажите|давай|дайте)\b", " ", n)
+    return _RE_SPACE.sub(" ", n).strip()
 
 
 def _looks_like_product_selection_reply(text: str) -> bool:
@@ -2596,6 +2797,65 @@ def _resolve_current_viewing_product(c: "Cardinal", m: Any) -> tuple[dict[str, A
             CHAT_LOT_AT[chat_key] = time.time()
             return lot, max(0.82, score), "buyer_viewing_text"
     return None, 0.0, "unknown"
+
+
+def _current_conversation_product(c: "Cardinal", m: Any) -> dict[str, Any] | None:
+    """Последний реально обсуждавшийся лот, затем фактически открытый buyer_viewing."""
+    chat_key = str(getattr(m, "chat_id", "") or "")
+    previous = _last_resolved_product(chat_key)
+    if previous is not None:
+        return previous
+    viewing_lot, _score, _source = _resolve_current_viewing_product(c, m)
+    return viewing_lot
+
+
+def _alternative_lot_candidates(
+    c: "Cardinal", m: Any, text: str, limit: int = 3
+) -> list[tuple[dict[str, Any], float]]:
+    """Подбирает альтернативы, никогда не возвращая только что отклонённый лот."""
+    current = _current_conversation_product(c, m)
+    excluded_id = str(current.get("id") or "") if current else ""
+    query = _product_switch_query(text)
+    cap = max(1, min(5, int(limit or 3)))
+
+    if query and _product_tokens(query):
+        ranked = find_lot_candidates(query, max(cap + 3, 6))
+        filtered = [(lot, score) for lot, score in ranked if str(lot.get("id") or "") != excluded_id]
+        if filtered:
+            return filtered[:cap]
+
+    with LOCK:
+        items = [lot for lot in LOTS.values() if str(lot.get("id") or "") != excluded_id]
+    if not items:
+        return []
+    if current is not None:
+        ranked = [(lot, _candidate_family_similarity(current, lot)) for lot in items]
+        ranked.sort(key=lambda item: item[1], reverse=True)
+        related = [(lot, score) for lot, score in ranked if score >= 0.30]
+        if related:
+            return related[:cap]
+    # Если семейство определить нельзя, лучше показать несколько реальных лотов,
+    # чем снова выбрать отвергнутый buyer_viewing или зациклить уточнение.
+    return [(lot, 0.30) for lot in items[:cap]]
+
+
+def _general_question_relates_to_lot(text: str, lot: dict[str, Any] | None) -> bool:
+    """Связан ли справочный термин с открытым лотом по реальным словам/описанию."""
+    if lot is None or _is_context_product_reference(text):
+        return lot is not None
+    query = set(_product_tokens(text))
+    if not query:
+        return False
+    # Вопросительные/общие слова уже отфильтрованы product_tokens; дополнительно
+    # убираем слишком общие доменные токены, чтобы «что такое аккаунт» не цеплял
+    # любой открытый аккаунтный лот автоматически.
+    generic = {"akkaunt", "tovar", "lot", "pokupka", "priobretenie", "igra", "usluga"}
+    query -= generic
+    if not query:
+        return False
+    source = _lot_identity_text(lot) + " " + str(lot.get("full_description") or "")[:1000]
+    lot_tokens = set(_product_tokens(source))
+    return bool(query & lot_tokens)
 
 
 def resolve_product(c: "Cardinal", m: Any, text: str, force_viewing: bool = False) -> tuple[dict[str, Any] | None, float, str]:
@@ -6804,6 +7064,50 @@ _GENERAL_HIGH_RISK_RE = re.compile(
     r"возврат\w*\s+(?:будет|возможен|гарантирован)|замен\w*\s+(?:будет|возможна|гарантирована)|"
     r"безопас\w*|бан\w*\s+не\s+будет)", re.I,
 )
+_GENERAL_SELLER_PRODUCT_CLAIM_RE = re.compile(
+    r"(?iu)(?:\bпо\s+(?:этому\s+)?лоту\b|\bв\s+(?:этом\s+)?лоте\b|"
+    r"\b(?:этот|данный|выбранный|наш)\s+(?:лот|товар|аккаунт|ключ|услуга)\b|"
+    r"\bу\s+продавц\w*\b|\bпродавец\s+(?:да[её]т|делает|работает|выда[её]т|гарантирует|прода[её]т)|"
+    r"\b(?:у\s+нас|у\s+меня)\s+(?:есть|нет|имеется|доступен|доступна|прода[её]тся|продаются)\b|"
+    r"\b(?:мы|я)\s+(?:прода[её]м|продаю|выда[её]м|выдаю|гарантируем|гарантирую)\b|"
+    r"\bтакого\s+(?:лота|товара|аккаунта|ключа|услуги)\s+(?:нет|не\s+прода[её]м|не\s+продаю)\b|"
+    r"\b(?:цена|стоимость)\s+(?:составляет|равна|от|до)\b|"
+    r"\b(?:есть|имеется|доступен|доступна|доступно|доступны)\s+в\s+наличии\b)"
+)
+
+
+def _answer_is_safe_general_dialogue(buyer_text: str, answer: str) -> bool:
+    """Можно ли трактовать ответ как обычный general-dialogue без seller evidence.
+
+    Этот repair нужен против ошибок маленьких моделей, которые пишут нормальное
+    «Конечно, помогу. Что уточнить?» но ошибочно ставят source=seller/product.
+    Он никогда не ослабляет проверку коммерческих фактов.
+    """
+    text = str(answer or "").strip()
+    if not text:
+        return False
+    if any((
+        _requires_specific_product_fact(buyer_text),
+        looks_seller_profile_question(buyer_text),
+        is_seller_trust_question(buyer_text),
+    )):
+        return False
+    if _GENERAL_HIGH_RISK_RE.search(text) or _GENERAL_SELLER_PRODUCT_CLAIM_RE.search(text):
+        return False
+    if any((
+        _PRICE_RE.search(text),
+        _AUTO_DELIVERY_RE.search(text),
+        _WARRANTY_TOPIC_RE.search(text),
+        _AVAILABILITY_CLAIM_RE.search(text),
+        _WORK_HOURS_TOPIC_RE.search(text),
+        _RESPONSE_TIME_TOPIC_RE.search(text),
+    )):
+        return False
+    # Валюта/процент в general-ответе часто является конкретным коммерческим
+    # обещанием. Обычные числа (математика, названия игр, справка) разрешены.
+    if re.search(r"(?iu)(?:₽|руб\w*|usd|eur|доллар\w*|евро|\d\s*%)", text):
+        return False
+    return True
 
 
 def _evidence_source_text(
@@ -6892,7 +7196,7 @@ def validate_ai_answer(
             return False, "неуместное упоминание автовыдачи"
         if _WARRANTY_TOPIC_RE.search(text) and not _WARRANTY_TOPIC_RE.search(buyer_text):
             return False, "неуместное упоминание гарантии"
-        if _DISCOUNT_TOPIC_RE.search(text) and not _DISCOUNT_TOPIC_RE.search(buyer_text):
+        if _DISCOUNT_TOPIC_RE.search(text) and not is_discount_question(buyer_text):
             return False, "неуместное упоминание скидки"
         if _AVAILABILITY_CLAIM_RE.search(text) and not _AVAILABILITY_QUERY_RE.search(buyer_text):
             return False, "неуместное утверждение о наличии/покупке"
@@ -6916,29 +7220,103 @@ def validate_ai_answer(
             elif not _NO_CONFIRMED_DATA_RE.search(text):
                 return False, "фактический ответ без подтверждающего фрагмента"
         elif scope == "general":
-            if _GENERAL_HIGH_RISK_RE.search(text):
-                return False, "неподтверждённое конкретное утверждение в общем ответе"
+            if _GENERAL_HIGH_RISK_RE.search(text) or _GENERAL_SELLER_PRODUCT_CLAIM_RE.search(text):
+                return False, "неподтверждённое seller/product-утверждение в общем ответе"
+            if any((
+                _AUTO_DELIVERY_RE.search(text),
+                _WARRANTY_TOPIC_RE.search(text),
+                _AVAILABILITY_CLAIM_RE.search(text),
+                _WORK_HOURS_TOPIC_RE.search(text),
+                _RESPONSE_TIME_TOPIC_RE.search(text),
+            )):
+                return False, "коммерческий факт нельзя подтверждать source=general"
         elif not _NO_CONFIRMED_DATA_RE.search(text):
             return False, "ответ без понятного источника"
 
     authoritative = _authoritative_ai_source(lot, seller_info)
-    if _PRICE_RE.search(text) and not _PRICE_QUERY_RE.search(buyer_text):
+    if _PRICE_RE.search(text) and not is_price_question(buyer_text):
         return False, "неуместная цена/валюта, которую покупатель не спрашивал"
 
-    allowed_numbers = _normalized_number_set(
-        str(buyer_text or "") + "\n"
-        + _sanitize_message_for_ai(str(buyer_context or "")) + "\n"
-        + authoritative + "\n" + str(public_context or "")
+    # Для seller/product/buyer/web числовые факты по-прежнему требуют источник.
+    # В безопасном source=general разрешаем вычисления и общеизвестные числа:
+    # иначе на «2+2?» защита превращала правильный ответ «4» в fallback.
+    enforce_number_grounding = not (
+        scope == "general" and _answer_is_safe_general_dialogue(buyer_text, text)
     )
-    for m in _NUMBER_RE.finditer(text):
-        token = m.group(0).replace(" ", "").replace(",", ".").rstrip("%")
-        try:
-            token = str(float(token)).rstrip("0").rstrip(".") if "." in token else str(int(token))
-        except Exception:
-            pass
-        if token not in allowed_numbers:
-            return False, f"неподтверждённое число: {m.group(0)}"
+    if enforce_number_grounding:
+        allowed_numbers = _normalized_number_set(
+            str(buyer_text or "") + "\n"
+            + _sanitize_message_for_ai(str(buyer_context or "")) + "\n"
+            + authoritative + "\n" + str(public_context or "")
+        )
+        for m in _NUMBER_RE.finditer(text):
+            token = m.group(0).replace(" ", "").replace(",", ".").rstrip("%")
+            try:
+                token = str(float(token)).rstrip("0").rstrip(".") if "." in token else str(int(token))
+            except Exception:
+                pass
+            if token not in allowed_numbers:
+                return False, f"неподтверждённое число: {m.group(0)}"
     return True, ""
+
+
+def validate_ai_answer_with_repair(
+    answer: str,
+    buyer_text: str,
+    lot: dict[str, Any] | None,
+    seller_info: str,
+    *,
+    evidence: str = "",
+    source_scope: str = "auto",
+    require_evidence: bool = False,
+    buyer_context: str = "",
+    public_context: str = "",
+    scope_mismatch: str = "",
+) -> tuple[bool, str, bool]:
+    """Проверяет grounding и чинит только ошибочную маркировку безопасного general-ответа.
+
+    Маленькие модели иногда дают нормальный разговорный ответ, но ставят
+    source=seller/product. Раньше такой ответ заменялся канцелярским fallback.
+    Repair повторно прогоняет тот же safety/grounding-фильтр как source=general.
+    Коммерческие факты, seller/profile-факты и чувствительные данные через этот
+    путь не проходят.
+    """
+    if scope_mismatch:
+        grounded_ok, grounded_reason = False, str(scope_mismatch)
+    else:
+        grounded_ok, grounded_reason = validate_ai_answer(
+            answer,
+            buyer_text,
+            lot,
+            seller_info,
+            evidence=evidence,
+            source_scope=source_scope,
+            require_evidence=require_evidence,
+            buyer_context=buyer_context,
+            public_context=public_context,
+        )
+    if grounded_ok:
+        return True, grounded_reason, False
+
+    if not SETTINGS.get("strict_grounding", True):
+        return False, grounded_reason, False
+    if not _answer_is_safe_general_dialogue(buyer_text, answer):
+        return False, grounded_reason, False
+
+    general_ok, general_reason = validate_ai_answer(
+        answer,
+        buyer_text,
+        None,
+        seller_info,
+        evidence="",
+        source_scope="general",
+        require_evidence=True,
+        buyer_context=buyer_context,
+        public_context=public_context,
+    )
+    if general_ok:
+        return True, f"source repaired to general (исходно: {grounded_reason})", True
+    return False, grounded_reason or general_reason, False
 
 
 def grounded_fallback_reply(buyer_text: str, lot: dict[str, Any] | None) -> str:
@@ -6972,14 +7350,39 @@ def grounded_fallback_reply(buyer_text: str, lot: dict[str, Any] | None) -> str:
             return buyer_price_reply(lot)
         return "Уточните, пожалуйста, цену какого лота нужно проверить."
 
-    if looks_general_information_question(buyer_text) and SETTINGS.get("public_sources_enabled", True):
+    if looks_general_information_question(buyer_text):
         if lot:
-            return "Не удалось получить достаточно надёжную справку из открытых источников по этому термину для выбранного лота."
-        return "Не удалось получить достаточно надёжную справку по этому термину. Можно уточнить вопрос другими словами."
+            return (
+                "Не хочу додумывать справочную часть вопроса и смешивать её с данными выбранного лота. "
+                "Уточните, пожалуйста, что именно нужно объяснить или проверить по товару."
+            )
+        return (
+            "Не хочу додумывать ответ, если смысл вопроса можно понять по-разному. "
+            "Уточните, пожалуйста, одним сообщением, что именно хотите узнать."
+        )
+
+    if lot and _requires_specific_product_fact(buyer_text):
+        return (
+            "По этому пункту нет подтверждённых данных, поэтому придумывать характеристику товара не буду. "
+            "Если нужно, попросите продавца уточнить это в чате."
+        )
 
     if lot:
-        return "В информации этого лота такой ответ не указан."
-    return "В доступной информации продавца такой ответ не указан."
+        return (
+            "Не уверен, что правильно связал вопрос с выбранным лотом, поэтому не буду угадывать. "
+            "Уточните, пожалуйста, что именно хотите узнать по этому товару или напишите «другой лот»."
+        )
+
+    if _requires_specific_product_fact(buyer_text) or looks_product_dependent(buyer_text):
+        return (
+            "Чтобы не придумывать данные товара, уточните, пожалуйста, название или игру нужного лота. "
+            "После этого отвечу только по подтверждённой информации."
+        )
+
+    return (
+        "Не хочу угадывать смысл сообщения. Уточните, пожалуйста, вопрос одним сообщением — "
+        "можно просто своими словами."
+    )
 
 
 def _rule_by_id(rule_id: Any) -> dict[str, Any] | None:
@@ -7206,6 +7609,9 @@ small_talk | product | purchase | order_help | seller_public | seller_call | gen
 ПРАВИЛА КАЧЕСТВА:
 1. Отвечай кратко, естественно и по существу, обычно 1–3 предложения.
 2. Если вопрос разрешён и ответ известен — отвечай прямо. Не отказывай просто из-за необычного стиля сообщения.
+- Шутка, абсурдный, бытовой или нетоварный вопрос не становится seller/product-фактом только потому, что его нет в описании продавца. Отвечай естественно или нейтрально как source="general"; шутить в ответ необязательно.
+- Если формулировка неоднозначна (например, «приобретение аккаунта», «другой хочу») и из контекста нельзя уверенно понять товар или цель, задай ОДНО короткое конкретное уточнение вместо догадки.
+- Для source="general" evidence не нужен, пока ответ не содержит конкретных коммерческих утверждений о продавце, лоте, заказе, цене, наличии, сроках, гарантии или действиях продавца.
 3. Не добавляй без запроса цену, наличие, количество, автовыдачу, сроки, гарантии, рекламу, призыв купить или иной факт.
 - На вопрос о цене используй строку «Цена для покупателя». «Базовая цена лота» не является итогом к оплате и не должна выдаваться покупателю как конечная цена.
 - Никогда не выводи служебные метки модерации/классификации вроде «User Safety: safe», «Response Safety: safe» или policy labels. Покупателю нужен только естественный ответ.
@@ -7720,19 +8126,22 @@ def _handle_smart_router(
             elif not product_scope and decision_source in {"product", "lot", "web", "mixed", "auto"}:
                 scope_mismatch = "нетоварный ответ использует недоступный источник"
 
-        if scope_mismatch:
-            grounded_ok, grounded_reason = False, scope_mismatch
-        else:
-            grounded_ok, grounded_reason = validate_ai_answer(
-                answer,
-                buyer_text,
-                lot,
-                seller_info,
-                evidence=decision_evidence,
-                source_scope=decision_source,
-                require_evidence=True,
-                buyer_context=buyer_context,
-                public_context=public_context,
+        grounded_ok, grounded_reason, grounding_repaired = validate_ai_answer_with_repair(
+            answer,
+            buyer_text,
+            lot,
+            seller_info,
+            evidence=decision_evidence,
+            source_scope=decision_source,
+            require_evidence=True,
+            buyer_context=buyer_context,
+            public_context=public_context,
+            scope_mismatch=scope_mismatch,
+        )
+        if grounding_repaired:
+            logger.info(
+                f"{LOG_PREFIX} AI-router исправил ошибочную маркировку источника: "
+                f"{grounded_reason}"
             )
         grounding_blocked = not grounded_ok
         if grounding_blocked:
@@ -8153,16 +8562,16 @@ def _enqueue_chat_message(c: "Cardinal", m: Any, text: str) -> None:
 
 _WATERMARK_META: dict[str, tuple[str, str, str, str]] = {
     "ai": (
-        "ai_watermark_enabled", "ai_watermark_text", "🤖 Ответ сгенерирован ИИ", "🤖 AI-ответ",
+        "ai_watermark_enabled", "ai_watermark_text", "🤖 ИИ", "🤖 AI-ответ",
     ),
     "ai_template": (
-        "ai_template_watermark_enabled", "ai_template_watermark_text", "🤖 Ответ по AI-шаблону", "🧠 AI→шаблон",
+        "ai_template_watermark_enabled", "ai_template_watermark_text", "🧠 AI", "🧠 AI→шаблон",
     ),
     "template": (
-        "local_template_watermark_enabled", "local_template_watermark_text", "🧩 Автоответ по шаблону", "🧩 Локальный шаблон",
+        "local_template_watermark_enabled", "local_template_watermark_text", "🧩 Авто", "🧩 Локальный шаблон",
     ),
     "system": (
-        "system_watermark_enabled", "system_watermark_text", "⚙️ Автоматический ответ", "⚙️ Служебный ответ",
+        "system_watermark_enabled", "system_watermark_text", "⚙️ Авто", "⚙️ Служебный ответ",
     ),
 }
 
@@ -8211,7 +8620,14 @@ def _ai_watermark_value() -> str:
 
 
 def _all_known_watermark_texts() -> set[str]:
-    marks: set[str] = set()
+    marks: set[str] = {
+        # Legacy defaults are kept here so bootstrap/history cleanup also works
+        # after upgrading to the compact v2.6.7 signatures.
+        "🤖 Ответ сгенерирован ИИ",
+        "🤖 Ответ по AI-шаблону",
+        "🧩 Автоответ по шаблону",
+        "⚙️ Автоматический ответ",
+    }
     for kind, (_enabled_key, _text_key, default_text, _label) in _WATERMARK_META.items():
         marks.add(default_text)
         marks.add(_configured_watermark_text(kind))
@@ -8238,7 +8654,7 @@ def _with_watermark(text: str, kind: str | None = "ai") -> str:
     mark = _watermark_value(kind)
     if not mark:
         return value
-    return f"{value}\n\n{mark}" if value else mark
+    return f"{value}\n{mark}" if value else mark
 
 
 def _with_ai_watermark(text: str) -> str:
@@ -8322,11 +8738,18 @@ def _clarify(c: "Cardinal", m: Any, product: bool = False, original_text: str = 
         RUNTIME_STATS["last_decision"] = "уточнение товара" if product else "уточнение"
 
 
-def _ask_product_candidates(c: "Cardinal", m: Any, ranked: list[tuple[dict[str, Any], float]], no_match: bool = False) -> None:
+def _ask_product_candidates(
+    c: "Cardinal",
+    m: Any,
+    ranked: list[tuple[dict[str, Any], float]],
+    no_match: bool = False,
+    *,
+    intro: str = "",
+) -> None:
     max_candidates = max(1, min(3, int(SETTINGS.get("product_clarify_max_candidates", 3))))
     useful = [(lot, score) for lot, score in ranked[:max_candidates] if score >= 0.25]
     if useful:
-        lines = ["Не смог точно выбрать один лот. Выберите ближайший вариант:" if not no_match else "Точного совпадения нет; вот ближайшие варианты:"]
+        lines = [intro or ("Не смог точно выбрать один лот. Выберите ближайший вариант:" if not no_match else "Точного совпадения нет; вот ближайшие варианты:")]
         ids: list[str] = []
         for i, (lot, score) in enumerate(useful, 1):
             ids.append(str(lot.get("id") or ""))
@@ -8354,6 +8777,39 @@ def _ask_product_candidates(c: "Cardinal", m: Any, ranked: list[tuple[dict[str, 
             if pending is not None:
                 pending["at"] = time.time()
 
+
+
+def _start_product_switch(c: "Cardinal", m: Any, buyer_text: str) -> bool:
+    """Обрабатывает «другой лот / не этот» до buyer_viewing и AI."""
+    chat_key = str(getattr(m, "chat_id", "") or "")
+    if not LOTS:
+        try:
+            sync_lots(c, enrich=False)
+        except Exception:
+            logger.debug(f"{LOG_PREFIX} Не удалось обновить лоты перед сменой товара.", exc_info=True)
+    ranked = _alternative_lot_candidates(
+        c, m, buyer_text, int(SETTINGS.get("product_clarify_max_candidates", 3))
+    )
+    _pending_product_clear(chat_key)
+    if not ranked:
+        if _send(
+            c, m,
+            "Другой подходящий лот сейчас не удалось определить. Напишите название игры/товара или часть названия — я поищу по каталогу.",
+        ):
+            RUNTIME_STATS["last_decision"] = "смена товара: нет альтернатив"
+        return True
+
+    _pending_product_set(m, "", selection_only=True)
+    _ask_product_candidates(c, m, ranked, intro="Выберите другой лот:")
+    RUNTIME_STATS["product_ambiguous"] += 1
+    RUNTIME_STATS["last_decision"] = "смена товара: показаны альтернативы"
+    return True
+
+
+def _selected_product_confirmation(lot: dict[str, Any]) -> str:
+    title_raw = str(lot.get("title") or lot.get("description") or "").strip()
+    title = _sanitize_product_context(title_raw) or "выбранный лот"
+    return f"Выбрал «{title}». Что хотите узнать по нему?"
 
 
 def process_buyer_message(
@@ -8417,6 +8873,12 @@ def process_buyer_message(
         RUNTIME_STATS["privacy_blocks"] += 1
         if _send(c, m, _privacy_refusal_reply(restricted_code)):
             RUNTIME_STATS["last_decision"] = f"локальный policy/privacy отказ: {restricted_code}"
+        return
+
+    # Явная смена товара сильнее текущего buyer_viewing и старого pending.
+    # «другой лот / не этот / другой хочу» никогда не должна возвращать тот же лот.
+    if forced_lot is None and _is_product_switch_request(buyer_text):
+        _start_product_switch(c, m, buyer_text)
         return
 
     seller_lot_count_intent = is_seller_lot_count_question(buyer_text)
@@ -8522,11 +8984,17 @@ def process_buyer_message(
             if pending_result is not None:
                 found_lot, found_score, found_source, ranked, original_text = pending_result
                 if found_lot is not None:
+                    selection_only = bool(pending.get("selection_only", False))
+                    choice = _number_choice(buyer_text)
+                    followup_text = _selection_followup_text(buyer_text, choice)
                     _remember_resolved_product(chat_key, found_lot)
                     _pending_product_clear(chat_key)
                     RUNTIME_STATS["product_resolved"] += 1
                     RUNTIME_STATS["last_decision"] = f"товар выбран {found_score:.0%}: {found_lot.get('id')}"
-                    target_question = original_text or buyer_text
+                    if selection_only and not followup_text:
+                        _send(c, m, _selected_product_confirmation(found_lot))
+                        return
+                    target_question = followup_text or original_text or buyer_text
                     return process_buyer_message(
                         c,
                         m,
@@ -8589,10 +9057,16 @@ def process_buyer_message(
                 if pending_result is not None:
                     found_lot, found_score, found_source, ranked, original_text = pending_result
                     if found_lot is not None:
+                        selection_only = bool(pending.get("selection_only", False))
+                        choice = _number_choice(buyer_text)
+                        followup_text = _selection_followup_text(buyer_text, choice)
                         _remember_resolved_product(chat_key, found_lot)
                         _pending_product_clear(chat_key)
                         RUNTIME_STATS["product_resolved"] += 1
-                        target_question = original_text or buyer_text
+                        if selection_only and not followup_text:
+                            _send(c, m, _selected_product_confirmation(found_lot))
+                            return
+                        target_question = followup_text or original_text or buyer_text
                         return process_buyer_message(
                             c,
                             m,
@@ -8673,7 +9147,8 @@ def process_buyer_message(
         and not product_context_optional
         and (
             requires_product
-            or looks_product_dependent(buyer_text)
+            or _requires_specific_product_fact(buyer_text)
+            or bool(_catalog_existence_subject(buyer_text))
             or _is_context_product_reference(buyer_text)
             or _has_explicit_product_reference(buyer_text)
         )
@@ -8703,6 +9178,28 @@ def process_buyer_message(
         catalog_signal, catalog_ranked = _catalog_reference_signal(buyer_text)
     strong_catalog_match = bool(catalog_ranked and _product_match_is_confident(buyer_text, catalog_ranked))
 
+    # Seller-wide discovery: «у вас есть колобки?» — это поиск по реальному
+    # каталогу, а не повод заставлять модель выдумывать наличие или говорить
+    # канцелярское «в информации продавца не указано».
+    catalog_subject = _catalog_existence_subject(buyer_text)
+    if (
+        forced_lot is None
+        and catalog_subject
+        and LOTS
+        and not catalog_signal
+        and not _requires_specific_product_fact(catalog_subject)
+        and not is_discount_question(buyer_text)
+    ):
+        safe_subject = _sanitize_product_context(catalog_subject) or catalog_subject
+        if _send(
+            c,
+            m,
+            f"Точного совпадения с «{safe_subject}» в текущем каталоге не нашёл. "
+            "Если вы имели в виду похожий товар, напишите название игры/товара чуть точнее.",
+        ):
+            RUNTIME_STATS["last_decision"] = "поиск товара: точного совпадения в каталоге нет"
+        return
+
     # Разговорное «есть <название лота>?» должно означать наличие, но только
     # когда текст действительно ссылается на реальный каталог. Это не превращает
     # произвольное «есть скидка?» в товарный интент и не мешает seller-wide вопросам.
@@ -8724,8 +9221,7 @@ def process_buyer_message(
         and (
             requires_product
             or context_product_reference
-            or (looks_product_dependent(buyer_text) and effective_rule is None)
-            or (looks_product_dependent(buyer_text) and bool(effective_rule and effective_rule.get("requires_product")))
+            or _requires_specific_product_fact(buyer_text)
         )
     )
     # Справочный вопрос сам по себе больше не требует лот. Если покупатель реально
@@ -8746,8 +9242,13 @@ def process_buyer_message(
     # контекстный web-поиск и одновременно не ломает обычный диалог.
     if forced_lot is None and contextual_public_info and not product_scope:
         viewing_lot, _viewing_score, _viewing_source = _resolve_current_viewing_product(c, m)
-        if viewing_lot is not None:
+        if viewing_lot is not None and _general_question_relates_to_lot(buyer_text, viewing_lot):
             product_scope = True
+        elif viewing_lot is not None:
+            logger.info(
+                f"{LOG_PREFIX} chat={chat_key} buyer_viewing_ignored=general_question_not_related "
+                f"lot={viewing_lot.get('id')}"
+            )
 
     if (
         forced_lot is None
@@ -8889,14 +9390,20 @@ def process_buyer_message(
             answer = ai_answer(m, buyer_text, lot if product_scope else None, effective_rule, rscore)
             answer, _dialogue_repair = _dialogue_reply_guard(getattr(m, "chat_id", ""), buyer_text, answer)
             seller_info = _seller_context_text()
-            grounded_ok, grounded_reason = validate_ai_answer(
+            grounded_ok, grounded_reason, grounding_repaired = validate_ai_answer_with_repair(
                 answer,
                 buyer_text,
                 lot if product_scope else None,
                 seller_info,
                 source_scope="product" if product_scope else "seller",
+                require_evidence=True,
                 buyer_context=_buyer_history_text(getattr(m, "chat_id", "")),
             )
+            if grounding_repaired:
+                logger.info(
+                    f"{LOG_PREFIX} legacy AI исправил ошибочную маркировку источника: "
+                    f"{grounded_reason}"
+                )
             if not grounded_ok:
                 RUNTIME_STATS["ai_grounding_blocked"] += 1
                 RUNTIME_STATS["last_decision"] = f"AI заблокирован: {grounded_reason}"

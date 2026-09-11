@@ -56,9 +56,9 @@ if TYPE_CHECKING:
 # Метаданные плагина
 # ============================================================================
 NAME = "Hybrid AI AutoReply 🤖 | @revengezza"
-VERSION = "2.6.8"
+VERSION = "2.6.9"
 DESCRIPTION = (
-    "Умный AI-заместитель продавца FunPay v2.6.8: поддерживает локальную/удалённую Ollama, облачные "
+    "Умный AI-заместитель продавца FunPay v2.6.9: поддерживает локальную/удалённую Ollama, облачные "
     "OpenAI-совместимые API и отдельную вкладку бесплатных API-моделей без локальной нейросети; в гибридном режиме сначала использует подходящие шаблоны, "
     "а если шаблон не подошёл — продолжает той же безопасной AI-логикой, что и AI-only. "
     "Диалог имеет приоритет над навязчивым выбором лота: точный товар запрашивается только для фактов, которые без него нельзя проверить; "
@@ -1621,6 +1621,8 @@ def _product_context_optional_for_dialogue(text: str, rule: dict[str, Any] | Non
         return True
     if is_seller_trust_question(text) or is_seller_summon_question(text):
         return True
+    if is_account_access_help_question(text):
+        return True
     selected = rule
     if selected is None:
         candidate, score, _phrase = best_rule(text)
@@ -1739,6 +1741,18 @@ def is_purchase_permission_question(text: str) -> bool:
     if re.search(
         rf"(?:^|\b)(?:(?:я\s+)?могу(?:\s+ли)?(?:\s+я)?|"
         rf"можно(?:\s+ли)?(?:\s+мне)?|разрешено(?:\s+ли)?(?:\s+мне)?)\s+{purchase_verb}(?:\b|$)",
+        n, re.I,
+    ):
+        return True
+
+    # Разговорный порядок с объектом между модальным словом и глаголом:
+    # «можно у вас аккаунт купить?», «можно этот лот взять?», «могу я подписку оформить?».
+    # Ограничиваем промежуток несколькими словами, чтобы не перехватывать длинные
+    # справочные фразы, где «можно» и «купить» относятся к разным частям вопроса.
+    if re.search(
+        rf"(?:^|\b)(?:(?:я\s+)?могу(?:\s+ли)?(?:\s+я)?|"
+        rf"можно(?:\s+ли)?(?:\s+мне)?|разрешено(?:\s+ли)?(?:\s+мне)?)"
+        rf"(?:\s+[\w-]+){{1,8}}\s+{purchase_verb}(?:\b|$)",
         n, re.I,
     ):
         return True
@@ -5737,6 +5751,11 @@ def _safe_ai_only_dialogue_fallback(chat_id: Any, buyer_text: str) -> str:
             "2FA — это двухфакторная аутентификация: кроме основного способа входа используется "
             "дополнительное подтверждение, например одноразовый код."
         )
+    if is_account_access_help_question(buyer_text):
+        return (
+            "Да, могу помочь разобраться со входом безопасно прямо в этом чате. "
+            "Напишите, что именно не получается; пароль, 2FA/OTP-коды, cookies и другие секреты присылать не нужно."
+        )
     if _CREDENTIAL_TOPIC_RE.search(buyer_text) and re.search(
         r"(?:не\s+(?:работает|подходит)|забыл|забыла|потерял|потеряла|как\s+(?:сменить|восстановить|сбросить))",
         buyer_text, re.I,
@@ -5871,8 +5890,10 @@ FUNPAY_RULES_AI_SUMMARY = """ОГРАНИЧЕНИЯ FUNPAY — СНИМОК ОТ
 - На разрешённые вопросы покупателя отвечать по существу, если ответ известен; необоснованно не игнорировать.
 - Не допускать мошенничество, обман, вред, накрутку/шантаж отзывами, недобросовестную конкуренцию,
   спам/массовые рассылки, флуд, угрозы, оскорбления и навязывание политических разговоров.
-- Не помогать покупать/продавать аккаунт FunPay и не содействовать незаконно полученным товарам, краже/продаже
+- Не помогать покупать/продавать САМ аккаунт FunPay и не содействовать незаконно полученным товарам, краже/продаже
   персональных данных, кардингу, взлому, вредоносному/нелицензионному ПО или иным явно запрещённым товарам/услугам.
+  Обычный вопрос «можно купить аккаунт?» про игровой/сервисный аккаунт в текущем лоте НЕ означает торговлю аккаунтом FunPay.
+  Считать это запретом только когда из текста явно следует, что речь именно об аккаунте FunPay или другой запрещённой операции.
 - Не использовать внешние ссылки для обхода ограничений площадки.
 - Не обещать результат арбитража/спора и не советовать игнорировать администрацию. По заказу сообщать только
   подтверждённый статус и не придумывать действия продавца.
@@ -5897,7 +5918,7 @@ _DISCORD_TAG_RE = re.compile(r"\b[A-Za-z0-9_.-]{2,32}#\d{4}\b")
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"\b(?:парол\w*|password|passwd|token|токен\w*|api[_ -]?key|ключ\w*\s+api|secret|секрет\w*|"
     r"cookie\w*|cookies|golden_key|phpsessid|session(?:id)?|сесси\w*|2fa|otp|код\s+подтверждени\w*)\b"
-    r"\s*[:=\-]\s*[^\s,;]{3,}",
+    r"\s*[:=]\s*[^\s,;]{3,}",
     re.I,
 )
 _CONFIDENTIAL_TOPIC_RE = re.compile(
@@ -6251,6 +6272,13 @@ _ACCOUNT_ACCESS_REQUEST_RE = re.compile(
     r"(?:доступ|данн\w*\s+от\s+аккаунт\w*|данн\w*\s+аккаунт\w*).{0,35}(?:продавц\w*|владельц\w*|funpay|фанп(?:ей|эй|ея|эя)\w*))",
     re.I | re.S,
 )
+_ACCOUNT_ACCESS_HELP_RE = re.compile(
+    r"(?:(?:помож\w*|подскаж\w*|объясн\w*|что\s+делать|как).{0,55}"
+    r"(?:вход\w*|войти|зайти|авторизац\w*|залогин\w*).{0,55}(?:аккаунт\w*|акк\w*|профил\w*)|"
+    r"(?:вход\w*|войти|зайти|авторизац\w*|залогин\w*).{0,55}(?:аккаунт\w*|акк\w*|профил\w*)"
+    r".{0,55}(?:помож\w*|подскаж\w*|что\s+делать))",
+    re.I | re.S,
+)
 _OFF_PLATFORM_REQUEST_RE = re.compile(
     r"(?:(?:вне|мимо|без)\s+(?:funpay|фанп(?:ей|эй|ея|эя)\w*)|напрямую|без\s+сайта|обойд[её]м\s+(?:сайт|(?:funpay|фанп(?:ей|эй|ея|эя)\w*))|"
     r"(?:оплат\w*|оплачу|заплат\w*|заплачу|перевед\w*|переведу|скин\w*\s+ден\w*|скину\s+ден\w*).{0,45}"
@@ -6427,8 +6455,8 @@ def _privacy_prompt_block(*, router: bool = False) -> str:
         return (
             "PRIVACY GUARD: защищаются ТОЛЬКО включённые категории:\n" + numbered + "\n"
             "Важно: само обсуждение темы разрешено. Вопросы «что такое 2FA?», «можно ли сменить пароль?», "
-            "«как работает Telegram?» не являются утечкой и должны получать нормальный ответ. Блокируй конкретные "
-            "значения/явные просьбы раскрыть их, а не ключевые слова. " + tail
+            "«как работает Telegram?», «можно купить аккаунт?» и «поможете со входом?» не являются утечкой и должны получать нормальный ответ. "
+            "Блокируй конкретные значения/явные просьбы раскрыть их, а не ключевые слова или само слово «аккаунт». " + tail
         )
 
     return (
@@ -6451,6 +6479,21 @@ def _privacy_refusal_reply(code: str = "confidential") -> str:
     if code == "confidential":
         return "Не могу передавать защищённые финансовые или идентифицирующие данные продавца."
     return "Не могу передавать защищённые данные продавца."
+
+
+def is_account_access_help_question(text: str) -> bool:
+    """Обычная помощь со входом без запроса логина/пароля/кодов.
+
+    Нужна отдельно от privacy-detector: «поможете со входом после покупки?» —
+    разрешённый вопрос. Просьбы выдать сами credentials по-прежнему ловятся
+    ``_ACCOUNT_ACCESS_REQUEST_RE`` / ``_CONFIDENTIAL_REQUEST_RE``.
+    """
+    scan = _canonicalize_platform_mentions(str(text or "").strip())
+    if not scan:
+        return False
+    if _CONFIDENTIAL_REQUEST_RE.search(scan) or _ACCOUNT_ACCESS_REQUEST_RE.search(scan):
+        return False
+    return bool(_ACCOUNT_ACCESS_HELP_RE.search(scan))
 
 
 def _looks_like_privacy_topic_help(text: str) -> bool:
@@ -6525,6 +6568,36 @@ def _classify_restricted_request(text: str) -> str:
     if _FUNPAY_ACCOUNT_TRADE_RE.search(scan) or _PROHIBITED_ACTIVITY_RE.search(scan):
         return "funpay_rules" if _privacy_code_enabled("funpay_rules", scan) else ""
     return ""
+
+
+def _known_safe_guard_intent(text: str) -> bool:
+    """Высокоуверенные разрешённые вопросы, которые модель не должна превращать в policy/privacy отказ."""
+    scan = _canonicalize_platform_mentions(str(text or "").strip())
+    if not scan:
+        return False
+    if _classify_restricted_request(scan):
+        return False
+    return bool(is_purchase_permission_question(scan) or is_account_access_help_question(scan))
+
+
+def _router_refusal_supported(buyer_text: str, policy_code: str) -> tuple[bool, str]:
+    """Проверяет, имеет ли AI право блокировать входной вопрос.
+
+    Privacy-защита в первую очередь является защитой КОНКРЕТНЫХ значений на входе
+    и финального исходящего текста. Поэтому модель не может сама придумать privacy-
+    отказ на безопасной реплике. Для FunPay policy семантический отказ сохраняется,
+    но известные безопасные интенты (покупка текущего лота / помощь со входом без
+    credentials) не переопределяются моделью как нарушение правил.
+    """
+    code = str(policy_code or "funpay_rules").strip().lower()
+    local_code = _classify_restricted_request(buyer_text)
+    if local_code:
+        return True, local_code
+    if code in {"contacts", "confidential", "account_security"}:
+        return False, ""
+    if code in {"off_platform", "funpay_rules"} and _known_safe_guard_intent(buyer_text):
+        return False, ""
+    return True, code
 
 
 def _redact_bare_platform_contact_values(text: str) -> str:
@@ -6871,6 +6944,13 @@ def _outbound_safety_violation(text: str) -> str:
         for match in _URL_VALUE_RE.finditer(value):
             if not _FUNPAY_URL_VALUE_RE.match(match.group(0)):
                 return "off_platform"
+        # Финальный барьер не полагается только на классификацию модели: прямое
+        # предложение оплатить/провести сделку мимо FunPay блокируется даже без URL.
+        if _OFF_PLATFORM_REQUEST_RE.search(value) and not _REFUSAL_LANGUAGE_RE.search(value):
+            return "off_platform"
+        # Торговлю самим аккаунтом FunPay также нельзя пропустить через генерацию.
+        if _FUNPAY_ACCOUNT_TRADE_RE.search(value) and not _REFUSAL_LANGUAGE_RE.search(value):
+            return "funpay_rules"
 
     if _privacy_code_enabled("account_security", value):
         if _SECRET_ASSIGNMENT_RE.search(value) or _CREDENTIAL_INLINE_VALUE_RE.search(value):
@@ -6889,21 +6969,24 @@ def _outbound_safety_violation(text: str) -> str:
         if _IPV4_VALUE_RE.search(value) or _INTERNAL_ID_VALUE_RE.search(value):
             return "confidential"
 
-    # Тема сама по себе допустима; блокируем только seller-linked protected values.
-    if _CONFIDENTIAL_OWNER_CONTEXT_RE.search(value):
-        if _CREDENTIAL_TOPIC_RE.search(value) and _privacy_code_enabled("account_security", value):
-            return "account_security"
-        if (_FINANCIAL_TOPIC_RE.search(value) and _privacy_master_enabled()
-                and SETTINGS.get("privacy_protect_financial", True)):
-            return "confidential"
-        if (_IDENTIFIER_TOPIC_RE.search(value) and _privacy_master_enabled()
-                and SETTINGS.get("privacy_protect_identifiers", True)):
-            return "confidential"
+    # Само упоминание темы/владельца не является утечкой. Конкретные значения
+    # уже проверены выше отдельными value-detector'ами. Это принципиально для
+    # безопасных ответов вроде «пароль присылать не нужно» или «баланс не раскрывается»: 
+    # они обсуждают категорию, но не содержат защищённого значения.
     return ""
 
 
 # Некоторые маленькие модели даже при think=false могут печатать внутренние
 # рассуждения прямо в message.content. Такие ответы покупателю не показываем.
+_GUARD_REFUSAL_ANSWER_RE = re.compile(
+    r"(?:не\s+могу\s+(?:переда\w*|раскры\w*|помочь\s+с\s+этим\s+запросом)|"
+    r"защищ[её]нн\w*\s+(?:финансов\w*|данн\w*)|конфиденциальн\w*\s+данн\w*|"
+    r"личн\w*\s+контакт\w*|противореч\w*\s+правил\w*\s+funpay|"
+    r"сделк\w*.{0,35}вне\s+funpay)",
+    re.I | re.S,
+)
+
+
 _MODEL_SAFETY_LABEL_RE = re.compile(
     r"(?:^|\n)\s*(?:user|response|assistant|content|prompt)\s+safety\s*:\s*"
     r"(?:safe|unsafe|allowed|blocked|refused)\s*(?:$|\n)",
@@ -7487,6 +7570,8 @@ def validate_ai_answer(
         return False, "модель вернула служебную safety-классификацию вместо ответа"
     if _META_REASONING_RE.search(text):
         return False, "модель вывела внутреннее рассуждение/служебный контекст"
+    if _known_safe_guard_intent(buyer_text) and _GUARD_REFUSAL_ANSWER_RE.search(text):
+        return False, "ложный privacy/policy отказ на разрешённый вопрос"
     if not SETTINGS.get("strict_grounding", True):
         return True, ""
     if _AI_TECH_RE.search(text):
@@ -7659,6 +7744,11 @@ def grounded_fallback_reply(buyer_text: str, lot: dict[str, Any] | None) -> str:
         return (
             "2FA — это двухфакторная аутентификация: кроме основного способа входа используется "
             "дополнительное подтверждение, например одноразовый код."
+        )
+    if is_account_access_help_question(buyer_text):
+        return (
+            "Да, могу помочь разобраться со входом безопасно прямо в этом чате. "
+            "Напишите, что именно не получается; пароль, 2FA/OTP-коды, cookies и другие секреты присылать не нужно."
         )
     if _CREDENTIAL_TOPIC_RE.search(buyer_text) and re.search(
         r"(?:не\s+(?:работает|подходит)|забыл|забыла|потерял|потеряла|как\s+(?:сменить|восстановить|сбросить))",
@@ -7930,6 +8020,8 @@ small_talk | product | purchase | order_help | seller_public | seller_call | gen
   с реально доступным контекстом; если вариантов несколько, не угадывай и уточни один раз.
 - Если покупатель просит человека/продавца, используй seller. Запрос его Telegram/телефона/почты классифицируй как контактный; refuse делай только когда Privacy Guard для контактов включён.
 - Слова Telegram/ТГ/Discord/WhatsApp/VK могут быть частью названия товара или платформы услуги. «Подписчики Telegram», «Telegram Premium», «Discord Nitro» и аналогичные товарные формулировки НЕ являются запросом контакта сами по себе.
+- «Можно у вас аккаунт купить?» / «можно этот аккаунт купить?» — обычный purchase-вопрос о текущем лоте, а НЕ запрос приватных данных и НЕ торговля аккаунтом FunPay, если слово FunPay/Фанпей явно не относится к самому продаваемому аккаунту.
+- «Поможете со входом в аккаунт после покупки?» — разрешённая помощь/траблшутинг. Ответь по существу и попроси описать проблему, но не проси и не повторяй пароль, 2FA/OTP-коды, cookies, токены или другие секреты.
 - Не выдавай автоответчик за живого владельца. Не утверждай, что лично выполнил действие, если код/данные этого не подтверждают.
 - Не изображай личную жизнь или реальные эмоции владельца аккаунта; для small-talk используй нейтральный тон автоответчика.
 
@@ -8359,6 +8451,22 @@ def _handle_smart_router(
 
     if action == "refuse":
         policy_code = str(decision.get("policy_code") or "funpay_rules").strip().lower()
+        supported, enforced_code = _router_refusal_supported(buyer_text, policy_code)
+        if not supported:
+            logger.info(
+                f"{LOG_PREFIX} AI-router ложный refuse снят: code={policy_code} text={_sanitize_message_for_ai(buyer_text)[:120]!r}"
+            )
+            RUNTIME_STATS["last_decision"] = f"AI-router ложный refuse снят: {policy_code}"
+            if _known_safe_guard_intent(buyer_text):
+                reply = grounded_fallback_reply(buyer_text, lot if product_scope else None)
+                if _send(c, m, reply):
+                    if product_scope and lot is not None:
+                        _remember_resolved_product(getattr(m, "chat_id", ""), lot)
+                    RUNTIME_STATS["router_answers"] += 1
+                    RUNTIME_STATS["last_decision"] = "AI-router ложный отказ заменён безопасным ответом"
+                return True
+            return False
+        policy_code = enforced_code or policy_code
         if not _privacy_code_enabled(policy_code, buyer_text):
             logger.info(
                 f"{LOG_PREFIX} AI-router refuse проигнорирован: защита {policy_code} отключена владельцем"

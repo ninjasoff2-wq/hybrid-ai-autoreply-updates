@@ -1,9 +1,9 @@
 {
   "schema": 1,
   "uuid": "b32e7a16-0fb6-4e78-96d2-9a2eb5d8a401",
-  "version": "2.6.10",
+  "version": "2.7.0",
   "download_url": "https://raw.githubusercontent.com/ninjasoff2-wq/hybrid-ai-autoreply-updates/main/updates/hybrid_ai/hybrid_ai_autoreply.py",
-  "sha256": "035e4566d459fd6eaf2a288d772ba92b637eacaf050e11c160f6a097be64d0cd",
+  "sha256": "a57336d9afb87fb065e8f3b0c5e6c4ca828c3e93d343f1a74eb4b3155771553d",
   "mandatory": false,
   "notes": "Hybrid AI AutoReply 2.5.2: расширенная нормализация Telegram/TG/ТГ, диалоговые fixes и усиленный privacy/policy guard."
 }

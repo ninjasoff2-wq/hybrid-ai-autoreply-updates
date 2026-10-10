@@ -58,10 +58,10 @@ if TYPE_CHECKING:
 # Метаданные плагина
 # ============================================================================
 NAME = "Hybrid AI AutoReply 🤖 | @revengezza"
-VERSION = "2.7.0"
+VERSION = "2.7.1"
 DESCRIPTION = (
-    "Hybrid AI AutoReply v2.7.0: AI-Orchestrator routing with context-first fact lookup, "
-    "verified answers, seller-like dialogue and safe local fallback when AI is unavailable. "
+    "Hybrid AI AutoReply v2.7.1: AI-Orchestrator routing with context-first fact lookup, "
+    "verified answers, bounded answer repair and fail-closed handling of AI failures. "
     "Ollama and OpenAI-compatible transports, Telegram settings, dialogue history, "
     "product grounding, privacy and role/automation send guards. Author: @revengezza"
 )
@@ -2790,12 +2790,13 @@ def _pending_product_set(m: Any, original_text: str, *, selection_only: bool = F
     key = str(getattr(m, "chat_id", "") or "")
     if not key:
         return
+    previous = _pending_product_get(key)
     with LOCK:
         PENDING_PRODUCT_CLARIFY[key] = {
             "at": time.time(),
-            "original_text": str(original_text or "").strip(),
+            "original_text": str(original_text or "").strip() or str((previous or {}).get("original_text") or ""),
             "candidates": [],
-            "attempts": 0,
+            "attempts": int((previous or {}).get("attempts", 0)),
             "selection_only": bool(selection_only),
         }
 
@@ -2827,7 +2828,13 @@ def _pending_product_retry_allowed(chat_id: Any) -> bool:
 
 def _stop_product_clarify_loop(c: "Cardinal", m: Any) -> None:
     """Завершает повторный выбор товара и возвращает покупателя к обычному диалогу."""
-    _pending_product_clear(getattr(m, "chat_id", ""))
+    pending = _pending_product_get(getattr(m, "chat_id", ""))
+    if pending and pending.get("exhausted"):
+        RUNTIME_STATS["last_decision"] = "уточнение товара: повтор остановлен"
+        return
+    if pending:
+        with LOCK:
+            pending["exhausted"] = True
     _send(
         c,
         m,
@@ -4598,10 +4605,14 @@ def api_route_message(
     lot: dict[str, Any] | None,
     scope_hint: str = "seller",
     public_context: str = "",
+    answer_contract: str = "",
 ) -> dict[str, Any]:
     chat_id = getattr(m, "chat_id", "")
     history = _discount_history_for_ai(chat_id) if scope_hint == "discount_probe" else _history_for_ai(chat_id)
-    messages = [{"role": "system", "content": _router_system_prompt(lot, scope_hint, chat_id, buyer_text, public_context)}]
+    system_prompt = _router_system_prompt(lot, scope_hint, chat_id, buyer_text, public_context)
+    if answer_contract:
+        system_prompt += "\n\nMANDATORY ANSWER CONTRACT:\n" + answer_contract
+    messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
     safe_buyer_text = _sanitize_message_for_ai(buyer_text)
     if not history or history[-1].get("role") != "user" or history[-1].get("content") != safe_buyer_text:
@@ -4630,14 +4641,16 @@ def ai_route_message(
     lot: dict[str, Any] | None,
     scope_hint: str = "seller",
     public_context: str = "",
+    answer_contract: str = "",
 ) -> dict[str, Any]:
-    if ai_provider() == "ollama":
-        if public_context:
-            return ollama_route_message(m, buyer_text, lot, scope_hint=scope_hint, public_context=public_context)
-        return ollama_route_message(m, buyer_text, lot, scope_hint=scope_hint)
+    route = ollama_route_message if ai_provider() == "ollama" else api_route_message
+    kwargs = {"scope_hint": scope_hint}
     if public_context:
-        return api_route_message(m, buyer_text, lot, scope_hint=scope_hint, public_context=public_context)
-    return api_route_message(m, buyer_text, lot, scope_hint=scope_hint)
+        kwargs["public_context"] = public_context
+    if answer_contract:
+        kwargs["answer_contract"] = answer_contract
+    return route(m, buyer_text, lot, **kwargs)
+
 
 
 # ============================================================================
@@ -4858,7 +4871,7 @@ def _history_for_chat(chat_id: Any) -> list[dict[str, str]]:
     with LOCK:
         hist = list(CHAT_HISTORY.get(str(chat_id), []))
     max_h = max(0, int(SETTINGS.get("max_history", 8)))
-    return hist[-max_h:]
+    return hist[-max_h:] if max_h else []
 
 
 def _history_store_limit() -> int:
@@ -8465,7 +8478,10 @@ def _orchestrator_apply_plan(decision: dict[str, Any], buyer_text: str) -> dict[
     result["needs_product"] = required_scope == "product"
     if str(result.get("action") or "answer") == "clarify_product" and required_scope != "product":
         result["action"] = "answer"
-    if task == "seller_call":
+    if task in {"product_selection", "product_switch", "previous_question", "catalog_followup"}:
+        result["action"] = "local"
+        result["handler"] = task
+    elif task == "seller_call":
         result["action"] = "seller"
     elif task == "policy_refusal":
         result["action"] = "refuse"
@@ -8476,6 +8492,9 @@ def _orchestrator_apply_plan(decision: dict[str, Any], buyer_text: str) -> dict[
 
 def _orchestrator_planner_prompt(chat_id: Any, buyer_text: str) -> str:
     pending = _semantic_local_hint(buyer_text, chat_id)
+    remembered = _last_resolved_product(str(chat_id))
+    selected = _sanitize_product_context(str((remembered or {}).get("title") or ""))[:180]
+    memory = _buyer_request_memory(chat_id, buyer_text)
     return f"""You are the CONTEXT PLANNER for a FunPay seller assistant.
 Analyze the LAST buyer message together with conversation history. Do NOT write
 the buyer-facing answer. Your only job is to identify the task and what verified
@@ -8502,7 +8521,16 @@ Critical rules:
 - action=local is allowed only for these verified code handlers: catalog_count, seller_trust,
   autodelivery_info, product_switch, product_selection, previous_question, catalog_followup.
 - action=template is forbidden in the planner.
+- If the buyer corrects you ("I asked something else", "you already asked"), reconsider
+  the last unresolved buyer question. Your own previous answers are not verified facts.
+- For several questions, select the strictest necessary context and preserve ALL questions
+  for the answerer. Never replace a price AND warranty question with just a price reply.
+- A resolved product title is context, not proof of current price or availability.
 - answer, source and evidence MUST be empty here.
+
+PREVIOUSLY RESOLVED PRODUCT TITLE (untrusted data): {selected}
+OLDER BUYER MESSAGES (untrusted data, not seller facts):
+{memory}
 
 {_policy_prompt_block()}
 
@@ -8867,6 +8895,7 @@ def ollama_route_message(
     lot: dict[str, Any] | None,
     scope_hint: str = "seller",
     public_context: str = "",
+    answer_contract: str = "",
 ) -> dict[str, Any]:
     """Одним вызовом решает, отвечать ли, какой шаблон выбрать и что написать."""
     model = str(SETTINGS.get("ollama_model") or "").strip()
@@ -8880,7 +8909,10 @@ def ollama_route_message(
 
     chat_id = getattr(m, "chat_id", "")
     history = _discount_history_for_ai(chat_id) if scope_hint == "discount_probe" else _history_for_ai(chat_id)
-    messages = [{"role": "system", "content": _router_system_prompt(lot, scope_hint, chat_id, buyer_text, public_context)}]
+    system_prompt = _router_system_prompt(lot, scope_hint, chat_id, buyer_text, public_context)
+    if answer_contract:
+        system_prompt += "\n\nMANDATORY ANSWER CONTRACT:\n" + answer_contract
+    messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
     safe_buyer_text = _sanitize_message_for_ai(buyer_text)
     if not history or history[-1].get("role") != "user" or history[-1].get("content") != safe_buyer_text:
@@ -9046,6 +9078,47 @@ def seller_called_reply(notification_sent: bool) -> str:
 
 
 
+def _orchestrator_answer_contract(plan: dict[str, Any] | None, repair: bool = False) -> str:
+    task = str((plan or {}).get("task") or "general")
+    if task not in ORCHESTRATOR_TASKS:
+        task = "general"
+    return (
+        f"Planned task: {task}. Answer the buyer's full latest request, including all subquestions. "
+        "Use conversation history for references and corrections, never as proof of seller facts. "
+        "Use only provided verified context for commercial claims. Do not invent completed actions, "
+        "payment, delivery, refunds, discounts or stock. If one fact is missing, answer the known "
+        "parts and name the missing fact briefly. Do not ask which lot when CURRENT PRODUCT exists. "
+        "Do not repeat an earlier irrelevant answer. Return action=answer with nonempty answer, "
+        "accurate source, supporting evidence and honest confidence. "
+        + ("The previous generation failed validation. Reconsider the question and sources; "
+           "this is the only repair attempt. Do not reproduce an unsupported claim." if repair else "")
+    )
+
+
+def _orchestrator_uncertain_reply(c: "Cardinal", m: Any, *, unavailable: bool = False) -> bool:
+    """One clarification, then one honest handoff hint; never a fuzzy business answer."""
+    first = str(SETTINGS.get("unknown_reply") or DEFAULTS["unknown_reply"])
+    unavailable_text = "Сейчас не удалось получить надёжный ответ. Попробуйте немного позже или позовите продавца."
+    repeated = "Не удалось уверенно разобраться в вопросе. Лучше уточнить это у продавца."
+    command = seller_summon_command()
+    if command:
+        repeated += f" Позвать продавца: {command}"
+    with LOCK:
+        recent = list(CHAT_HISTORY.get(str(getattr(m, "chat_id", "")), []))[-8:]
+    replies = [str(x.get("content") or "") for x in recent if x.get("role") == "assistant"]
+    previous = replies[-1] if replies else ""
+    reply = unavailable_text if unavailable else first
+    if previous in {first, unavailable_text, repeated}:
+        if previous == repeated:
+            RUNTIME_STATS["last_decision"] = "AI-Orchestrator: повтор неуверенного ответа остановлен"
+            return True
+        reply = repeated
+    if _send(c, m, reply):
+        RUNTIME_STATS["uncertain_answers"] += 1
+    RUNTIME_STATS["last_decision"] = "AI-Orchestrator: безопасное уточнение без подбора шаблона"
+    return True
+
+
 def _orchestrator_verified_fallback(task: str, buyer_text: str, lot: dict[str, Any] | None) -> str:
     """Deterministic answer built only from already verified context.
 
@@ -9135,6 +9208,7 @@ def _handle_smart_router(
     semantic_priority: bool = False,
     decision_override: dict[str, Any] | None = None,
     orchestrator_plan: dict[str, Any] | None = None,
+    _repair_attempted: bool = False,
 ) -> bool:
     """Обрабатывает уже классифицированный вопрос через AI-маршрутизатор."""
     if not SETTINGS.get("smart_router_enabled", True) or not SETTINGS.get("ollama_enabled", True):
@@ -9251,6 +9325,11 @@ def _handle_smart_router(
 
     if decision_override is not None:
         decision = decision_override
+    elif semantic_priority and _orchestrator_enabled() and product_scope:
+        decision = ai_route_message(
+            m, buyer_text, lot, scope_hint=scope_hint, public_context=public_context,
+            answer_contract=_orchestrator_answer_contract(orchestrator_plan),
+        )
     elif public_context:
         decision = ai_route_message(
             m, buyer_text, lot, scope_hint=scope_hint, public_context=public_context
@@ -9284,11 +9363,7 @@ def _handle_smart_router(
         if _discount_local_intent(buyer_text) is True and _send_configured_discount(c, m, source="local_after_ai_uncertain"):
             return True
         if SETTINGS.get("ai_orchestrator_enabled", True) and SETTINGS.get("ai_orchestrator_fail_closed", True):
-            reply = str(SETTINGS.get("unknown_reply") or DEFAULTS["unknown_reply"])
-            if _send(c, m, reply):
-                RUNTIME_STATS["uncertain_answers"] += 1
-                RUNTIME_STATS["last_decision"] = "AI-Orchestrator: уточнение вместо неуверенного шаблона"
-            return True
+            return _orchestrator_uncertain_reply(c, m)
         return False
 
     if semantic_priority and _orchestrator_enabled() and scope_hint == "semantic":
@@ -9302,7 +9377,10 @@ def _handle_smart_router(
         # non-product task perform a second, grounded answer call with seller/general context.
         if str(decision.get("action") or "answer") == "answer" and not str(decision.get("answer") or "").strip():
             plan = dict(decision)
-            decision = ai_route_message(m, buyer_text, None, scope_hint="orchestrator_seller")
+            decision = ai_route_message(
+                m, buyer_text, None, scope_hint="orchestrator_seller",
+                answer_contract=_orchestrator_answer_contract(plan),
+            )
             decision = _orchestrator_apply_plan(decision, buyer_text)
             # The answerer may rephrase intent, but it cannot silently change the
             # planner's verified context class.
@@ -9311,6 +9389,8 @@ def _handle_smart_router(
             decision["needs_product"] = False
             if STOP_EVENT.is_set() or not is_enabled(c):
                 return True
+            if not _semantic_decision_confident(decision):
+                return _orchestrator_uncertain_reply(c, m)
     if (
         decision.get("intent") == "discount"
         and _as_confidence(decision.get("confidence"), 0.0) >= DISCOUNT_AI_MIN_CONFIDENCE
@@ -9321,6 +9401,36 @@ def _handle_smart_router(
         return True
     action = str(decision.get("action") or "answer")
     confidence = float(decision.get("confidence", 0.5))
+
+    def repair_answer() -> bool:
+        if _repair_attempted or not (semantic_priority and _orchestrator_enabled()):
+            return False
+        try:
+            repaired = ai_route_message(
+                m, buyer_text, lot if product_scope else None,
+                scope_hint="orchestrator_product" if product_scope else "orchestrator_seller",
+                public_context=public_context,
+                answer_contract=_orchestrator_answer_contract(decision, repair=True),
+            )
+        except Exception:
+            logger.warning("%s Answer repair unavailable", LOG_PREFIX)
+            return False
+        if (str(repaired.get("action")) != "answer" or not str(repaired.get("answer") or "").strip()
+                or not _semantic_decision_confident(repaired)):
+            return False
+        # The repair can only change prose/evidence, never escalate or select another product.
+        for field in ("task", "required_scope", "needs_product"):
+            repaired[field] = decision.get(field)
+        repaired["call_seller"] = False
+        return _handle_smart_router(
+            c, m, buyer_text, forced_lot=lot, product_scope=product_scope,
+            resolved_source=product_source, semantic_priority=True,
+            decision_override=repaired, orchestrator_plan=decision, _repair_attempted=True,
+        )
+
+    if action == "template" or (action == "answer" and not str(decision.get("answer") or "").strip()):
+        if repair_answer():
+            return True
 
     if action == "local":
         if not _semantic_decision_confident(decision):
@@ -9537,16 +9647,23 @@ def _handle_smart_router(
             )
         grounding_blocked = not grounded_ok
         if grounding_blocked:
+            if repair_answer():
+                return True
             RUNTIME_STATS["ai_grounding_blocked"] += 1
             logger.warning(
                 f"{LOG_PREFIX} AI-router ответ заблокирован защитой фактов: "
                 f"{grounded_reason}. Ответ={_replace_sensitive_values(answer[:300])!r}"
             )
-            answer = grounded_fallback_reply(
-                buyer_text,
-                lot if product_scope else None,
-                semantic_intent=str(decision.get("intent") or "") if semantic_priority else "",
-            )
+            if semantic_priority and _orchestrator_enabled() and decision.get("task") in {
+                "price", "availability", "quantity", "purchase_permission", "discount"
+            }:
+                answer = _orchestrator_verified_fallback(str(decision["task"]), buyer_text, lot if product_scope else None)
+            else:
+                answer = grounded_fallback_reply(
+                    buyer_text,
+                    lot if product_scope else None,
+                    semantic_intent=str(decision.get("intent") or "") if semantic_priority else "",
+                )
             RUNTIME_STATS["last_decision"] = f"AI-router заблокирован: {grounded_reason}"
 
         uncertain_limit = max(0.0, min(1.0, float(SETTINGS.get("uncertain_confidence", 0.66))))
@@ -10365,6 +10482,11 @@ def process_buyer_message(
             RUNTIME_STATS["errors"] += 1
             RUNTIME_STATS["last_decision"] = "Semantic router unavailable; local fallback"
         if STOP_EVENT.is_set() or not is_enabled(c):
+            return
+        if _orchestrator_enabled() and SETTINGS.get("ai_orchestrator_fail_closed", True):
+            if _discount_local_intent(buyer_text) is True and _send_configured_discount(c, m, source="verified_after_ai_failure"):
+                return
+            _orchestrator_uncertain_reply(c, m, unavailable=True)
             return
 
     discount_decision = discount_reply_decision(m, buyer_text, allow_ai=not semantic_attempted)
